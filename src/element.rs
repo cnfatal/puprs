@@ -122,6 +122,10 @@ impl Element {
     // ── JavaScript ──────────────────────────────────────────────────
 
     /// Call a JS function on this element and return the result.
+    ///
+    /// The element is bound as `this` inside the function.  If you also need
+    /// the element available as a parameter (puppeteer-style `(el) => …`),
+    /// use [`call_js_fn_arg`] instead.
     pub async fn call_js_fn(
         &self,
         function_declaration: impl Into<String>,
@@ -130,6 +134,36 @@ impl Element {
         let result = self
             .inner
             .call_js_fn(function_declaration.into(), await_promise)
+            .await?;
+        Ok(EvaluationResult {
+            inner: chromiumoxide::js::EvaluationResult::new(result.result),
+        })
+    }
+
+    /// Call a JS function with the element passed as the **first argument**
+    /// (puppeteer semantics: `(el, ...args) => …`).
+    ///
+    /// This builds `Runtime.callFunctionOn` with the element's
+    /// `RemoteObjectId` in the `arguments` array, so arrow-function
+    /// predicates like `el => el.value.length > 0` work correctly.
+    pub async fn call_js_fn_arg(
+        &self,
+        function_declaration: impl Into<String>,
+        await_promise: bool,
+    ) -> Result<EvaluationResult> {
+        use chromiumoxide::cdp::js_protocol::runtime::CallArgument;
+
+        let self_arg = CallArgument::builder()
+            .object_id(self.inner.remote_object_id.clone())
+            .build();
+
+        let result = self
+            .inner
+            .call_js_fn_with_args(
+                function_declaration.into(),
+                await_promise,
+                vec![self_arg],
+            )
             .await?;
         Ok(EvaluationResult {
             inner: chromiumoxide::js::EvaluationResult::new(result.result),

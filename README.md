@@ -107,6 +107,42 @@ page.wait_for_function(
 - **Stealth** — `page.enable_stealth_mode()`
 - **Emulation** — user-agent, timezone, locale, HTTP auth
 
+## Example: Login Bot vs Bot Detection
+
+A complete attack-and-defense demo is included. A login server implements multiple bot detection layers; a stealth bot attempts to bypass them all.
+
+```sh
+# Terminal 1 — start the defense server
+cargo run --example login_server
+
+# Terminal 2 — launch the attack bot
+cargo run --example login_bot
+```
+
+**Defense (login_server)** — HTTP server with:
+
+| Detection             | Method                                            |
+| --------------------- | ------------------------------------------------- |
+| CSRF Token            | Server-issued token, validated on submit          |
+| Honeypot Field        | Hidden input — bots may fill it, humans won't     |
+| Timing Analysis       | Reject if form submitted < 2s after page load     |
+| Rate Limiting         | Max 5 attempts per 60s                            |
+| Mouse Tracking        | Require ≥ 5 mouse events                          |
+| `navigator.webdriver` | Front-end JS check                                |
+| Headless Fingerprint  | Check `navigator.plugins`, `navigator.languages`  |
+| User-Agent Pattern    | Reject `HeadlessChrome` / `Selenium` keywords     |
+| Keystroke Timing      | Reject uniform inter-key intervals (stddev < 5ms) |
+
+**Attack (login_bot)** — puprs automation with:
+
+- `StealthPlugin` — hides `navigator.webdriver`, patches headless fingerprints
+- `HeadlessMode::New` — Chrome's new headless mode (harder to detect)
+- Human-like mouse movement — Bézier curves with random jitter
+- Realistic typing — random 50–180ms delays between keystrokes
+- Form timing bypass — random pauses between fields
+- Honeypot avoidance — only interacts with visible form fields
+- CSRF token handling — waits for page JS to fetch the token before submit
+
 ## Plugin System (Design + First Implementation)
 
 puprs now includes a native Rust plugin system inspired by puppeteer-extra.

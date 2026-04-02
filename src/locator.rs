@@ -302,7 +302,7 @@ impl NodeLocator {
             loop {
                 let script = format!("(el) => ({})(el)", filter_fn);
                 let passed: bool = element
-                    .call_js_fn(&script, true)
+                    .call_js_fn_arg(&script, true)
                     .await
                     .ok()
                     .and_then(|r| r.into_value::<bool>().ok())
@@ -516,7 +516,7 @@ async fn apply_action_preconditions(
 /// element type (select, typeable input, contenteditable, etc.).
 async fn fill_element(element: &Element, value: &str, fill_opts: &FillOptions) -> Result<()> {
     let input_type: String = element
-        .call_js_fn(
+        .call_js_fn_arg(
             r#"(el) => {
                 if (el instanceof HTMLSelectElement) return 'select';
                 if (el instanceof HTMLTextAreaElement) return 'typeable-input';
@@ -539,7 +539,7 @@ async fn fill_element(element: &Element, value: &str, fill_opts: &FillOptions) -
     match input_type.as_str() {
         "select" => {
             element
-                .call_js_fn(
+                .call_js_fn_arg(
                     &format!(
                         r#"(el) => {{
                             el.value = {val_json};
@@ -555,7 +555,7 @@ async fn fill_element(element: &Element, value: &str, fill_opts: &FillOptions) -
             if value.len() < fill_opts.typing_threshold {
                 // Short text: detect common prefix and only type the rest.
                 let text_to_type: String = element
-                    .call_js_fn(
+                    .call_js_fn_arg(
                         &format!(
                             r#"(el) => {{
                                 const newValue = {val_json};
@@ -591,7 +591,7 @@ async fn fill_element(element: &Element, value: &str, fill_opts: &FillOptions) -
             } else {
                 // Long text: direct assignment (fast path).
                 element
-                    .call_js_fn(
+                    .call_js_fn_arg(
                         &format!(
                             r#"(el) => {{
                                 const newValue = {val_json};
@@ -612,7 +612,7 @@ async fn fill_element(element: &Element, value: &str, fill_opts: &FillOptions) -
         }
         "other-input" => {
             element
-                .call_js_fn(
+                .call_js_fn_arg(
                     &format!(
                         r#"(el) => {{
                             el.focus();
@@ -646,7 +646,7 @@ async fn scroll_element(element: &Element, options: &ScrollOptions) -> Result<()
     }
     let body = parts.join(" ");
     element
-        .call_js_fn(&format!("(el) => {{ {body} }}"), false)
+        .call_js_fn_arg(&format!("(el) => {{ {body} }}"), false)
         .await?;
     Ok(())
 }
@@ -662,7 +662,7 @@ async fn wait_for_visibility(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let is_visible: bool = element
-            .call_js_fn(
+            .call_js_fn_arg(
                 r#"(el) => {
                     const e = el.nodeType === Node.TEXT_NODE ? el.parentElement : el;
                     if (!e) return false;
@@ -722,7 +722,7 @@ async fn ensure_in_viewport(element: &Element, deadline: tokio::time::Instant) -
 /// Check if element intersects the viewport.
 async fn is_intersecting_viewport(element: &Element) -> Result<bool> {
     let val: bool = element
-        .call_js_fn(
+        .call_js_fn_arg(
             r#"(el) => {
                 const rect = el.getBoundingClientRect();
                 return rect.top < window.innerHeight
@@ -746,7 +746,7 @@ async fn wait_for_stable_bounding_box(
 ) -> Result<()> {
     loop {
         let stable: bool = element
-            .call_js_fn(
+            .call_js_fn_arg(
                 r#"(el) => {
                     return new Promise(resolve => {
                         requestAnimationFrame(() => {
@@ -779,7 +779,7 @@ async fn wait_for_stable_bounding_box(
 /// Wait for the element to be enabled (for form controls).
 async fn wait_for_enabled(element: &Element, timeout: Duration) -> Result<()> {
     let enabled: bool = element
-        .call_js_fn(
+        .call_js_fn_arg(
             r#"(el) => {
                 if (!(el instanceof HTMLElement)) return true;
                 const formControls = ['BUTTON','INPUT','SELECT','TEXTAREA','OPTION','OPTGROUP'];
@@ -801,7 +801,7 @@ async fn wait_for_enabled(element: &Element, timeout: Duration) -> Result<()> {
     loop {
         tokio::time::sleep(RETRY_DELAY).await;
         let now_enabled: bool = element
-            .call_js_fn(
+            .call_js_fn_arg(
                 r#"(el) => {
                     if (!(el instanceof HTMLElement)) return true;
                     return !el.hasAttribute('disabled');
