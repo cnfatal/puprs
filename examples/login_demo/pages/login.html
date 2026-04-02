@@ -1,0 +1,839 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Secure Login</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: system-ui, sans-serif;
+        background: #0f0f23;
+        color: #e0e0e0;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 100vh;
+      }
+      .login-card {
+        background: #1a1a2e;
+        border-radius: 12px;
+        padding: 2.5rem;
+        width: 380px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+      }
+      .login-card h1 {
+        text-align: center;
+        color: #00d4ff;
+        margin-bottom: 0.5rem;
+        font-size: 1.6rem;
+      }
+      .login-card .subtitle {
+        text-align: center;
+        color: #888;
+        margin-bottom: 1.5rem;
+        font-size: 0.85rem;
+      }
+      label {
+        display: block;
+        margin-bottom: 0.3rem;
+        font-size: 0.9rem;
+        color: #aaa;
+      }
+      input[type="text"],
+      input[type="password"] {
+        width: 100%;
+        padding: 0.7rem;
+        margin-bottom: 1rem;
+        border: 1px solid #333;
+        border-radius: 6px;
+        background: #16213e;
+        color: #e0e0e0;
+        font-size: 1rem;
+        transition: border-color 0.2s;
+      }
+      input:focus {
+        outline: none;
+        border-color: #00d4ff;
+      }
+      button[type="submit"] {
+        width: 100%;
+        padding: 0.75rem;
+        background: #00d4ff;
+        color: #0f0f23;
+        border: none;
+        border-radius: 6px;
+        font-size: 1rem;
+        font-weight: 700;
+        cursor: pointer;
+        transition: background 0.2s;
+      }
+      button[type="submit"]:hover {
+        background: #00b8d9;
+      }
+      button[type="submit"]:disabled {
+        background: #555;
+        cursor: not-allowed;
+      }
+      .error-msg {
+        color: #ff6b6b;
+        font-size: 0.85rem;
+        margin-top: 0.8rem;
+        text-align: center;
+        min-height: 1.2rem;
+      }
+      .detection-panel {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        background: rgba(17, 17, 17, 0.95);
+        font-family: monospace;
+        font-size: 0.72rem;
+        color: #666;
+        z-index: 100;
+        border-bottom: 1px solid #333;
+      }
+      .detection-bar {
+        display: flex;
+        align-items: center;
+        padding: 0.4rem 1rem;
+        cursor: pointer;
+        user-select: none;
+        gap: 0.5rem;
+      }
+      .detection-bar:hover {
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .detection-bar .title {
+        color: #888;
+        font-weight: bold;
+      }
+      .detection-bar .summary {
+        flex-grow: 1;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.2rem 0.8rem;
+      }
+      .detection-bar .toggle {
+        color: #555;
+        font-size: 0.65rem;
+        flex-shrink: 0;
+      }
+      .detection-details {
+        display: none;
+        padding: 0.5rem 1rem 0.6rem;
+        border-top: 1px solid #222;
+        max-height: 200px;
+        overflow-y: auto;
+      }
+      .detection-details.open {
+        display: block;
+      }
+      .detection-details table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      .detection-details td {
+        padding: 2px 8px 2px 0;
+        vertical-align: top;
+      }
+      .detection-details td:first-child {
+        color: #888;
+        white-space: nowrap;
+        width: 120px;
+      }
+      .detection-panel .item {
+        white-space: nowrap;
+      }
+      .detection-panel .pass {
+        color: #51cf66;
+      }
+      .detection-panel .fail {
+        color: #ff6b6b;
+      }
+      /* Honeypot: visually hidden but accessible to bots */
+      .hp-field {
+        position: absolute;
+        left: -9999px;
+        top: -9999px;
+        opacity: 0;
+        height: 0;
+        width: 0;
+      }
+      /* ── Captcha Widget ── */
+      .captcha-widget {
+        margin-bottom: 1rem;
+        border: 1px solid #333;
+        border-radius: 4px;
+        background: #16213e;
+        overflow: hidden;
+      }
+      .captcha-checkbox-area {
+        display: flex;
+        align-items: center;
+        padding: 0.8rem 1rem;
+        cursor: pointer;
+        user-select: none;
+      }
+      .captcha-checkbox {
+        width: 24px;
+        height: 24px;
+        border: 2px solid #555;
+        border-radius: 3px;
+        margin-right: 0.8rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.3s;
+        flex-shrink: 0;
+      }
+      .captcha-checkbox.checking {
+        border-color: #00d4ff;
+      }
+      .captcha-checkbox.checked {
+        border-color: #51cf66;
+        background: #51cf66;
+      }
+      .captcha-check-icon {
+        display: none;
+        color: #fff;
+        font-size: 16px;
+        font-weight: bold;
+      }
+      .captcha-checkbox.checked .captcha-check-icon {
+        display: block;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .captcha-spinner {
+        display: none;
+        width: 16px;
+        height: 16px;
+        border: 2px solid #00d4ff;
+        border-top-color: transparent;
+        border-radius: 50%;
+        animation: spin 0.6s linear infinite;
+      }
+      .captcha-checkbox.checking .captcha-spinner {
+        display: block;
+      }
+      .captcha-label {
+        flex-grow: 1;
+        font-size: 0.9rem;
+        color: #ccc;
+      }
+      .captcha-logo {
+        text-align: right;
+        flex-shrink: 0;
+      }
+      .captcha-logo-icon {
+        font-size: 1.2rem;
+      }
+      .captcha-logo-text {
+        font-size: 0.55rem;
+        color: #666;
+        margin-top: -2px;
+      }
+      .captcha-challenge {
+        border-top: 1px solid #333;
+        padding: 1rem;
+      }
+      .captcha-challenge-header {
+        font-size: 0.85rem;
+        color: #aaa;
+        margin-bottom: 0.8rem;
+        text-align: center;
+      }
+      .captcha-challenge-area {
+        position: relative;
+        width: 280px;
+        height: 180px;
+        margin: 0 auto;
+        background: #111;
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      .captcha-challenge-area canvas {
+        display: block;
+        width: 280px;
+        height: 180px;
+      }
+      .captcha-challenge-status {
+        text-align: center;
+        margin-top: 0.5rem;
+        font-size: 0.8rem;
+        min-height: 1.2rem;
+        color: #888;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="detection-panel" id="detection-panel">
+      <div class="detection-bar" id="detection-bar">
+        <span class="title">🛡 Browser Check</span>
+        <span class="summary" id="detection-summary"></span>
+        <span class="toggle" id="detection-toggle">▼ Details</span>
+      </div>
+      <div class="detection-details" id="detection-details"></div>
+    </div>
+    <div class="login-card">
+      <h1>🔒 Secure Login</h1>
+      <p class="subtitle">Bot detection enabled — can you get in?</p>
+      <form id="login-form" autocomplete="off">
+        <input type="hidden" id="csrf_token" name="csrf_token" value="" />
+
+        <label for="username">Username</label>
+        <input
+          type="text"
+          id="username"
+          name="username"
+          placeholder="Enter username"
+        />
+
+        <label for="password">Password</label>
+        <input
+          type="password"
+          id="password"
+          name="password"
+          placeholder="Enter password"
+        />
+
+        <!-- Honeypot field: invisible to humans, bots may fill it -->
+        <div class="hp-field">
+          <label for="email">Email</label>
+          <input
+            type="text"
+            id="email"
+            name="email"
+            tabindex="-1"
+            autocomplete="off"
+          />
+        </div>
+
+        <!-- Captcha widget -->
+        <div id="captcha-widget" class="captcha-widget">
+          <div class="captcha-checkbox-area" id="captcha-checkbox-area">
+            <div class="captcha-checkbox" id="captcha-checkbox">
+              <span class="captcha-check-icon">✓</span>
+              <div class="captcha-spinner"></div>
+            </div>
+            <span class="captcha-label">I'm not a robot</span>
+            <div class="captcha-logo">
+              <div class="captcha-logo-icon">🛡</div>
+              <div class="captcha-logo-text">pupCAPTCHA</div>
+            </div>
+          </div>
+          <div
+            class="captcha-challenge"
+            id="captcha-challenge"
+            style="display: none"
+          >
+            <div class="captcha-challenge-header">
+              Click the numbers in order: 1 → 5
+            </div>
+            <div
+              class="captcha-challenge-area"
+              id="captcha-challenge-area"
+            ></div>
+            <div
+              class="captcha-challenge-status"
+              id="captcha-challenge-status"
+            ></div>
+          </div>
+        </div>
+        <input type="hidden" id="captcha_token" name="captcha_token" value="" />
+
+        <button type="submit" id="submit-btn">Sign In</button>
+        <div class="error-msg" id="error-msg"></div>
+      </form>
+    </div>
+
+    <script>
+      (function () {
+        // ── State ──
+        var pageLoadTime = Date.now();
+
+        var mouseEvents = 0;
+        var mousePath = [];
+        var keyTimings = [];
+        var lastKeyTime = 0;
+        var focusEvents = [];
+
+        // ── Collect mouse movement data ──
+        document.addEventListener("mousemove", function (e) {
+          mouseEvents++;
+          if (mousePath.length < 100) {
+            mousePath.push({
+              x: e.clientX,
+              y: e.clientY,
+              t: Date.now() - pageLoadTime,
+            });
+          }
+        });
+
+        // ── Collect key timing data ──
+        document.addEventListener("keydown", function (e) {
+          var now = Date.now();
+          if (lastKeyTime > 0) {
+            keyTimings.push(now - lastKeyTime);
+          }
+          lastKeyTime = now;
+        });
+
+        // ── Track focus events ──
+        ["username", "password"].forEach(function (id) {
+          var el = document.getElementById(id);
+          el.addEventListener("focus", function () {
+            focusEvents.push({ field: id, time: Date.now() - pageLoadTime });
+          });
+        });
+
+        // ── Shared browser info collection (used by both Browser Check and captcha) ──
+        function collectBrowserInfo() {
+          var checks = [];
+          var fp = {};
+
+          // WebDriver
+          fp.webdriver = !!navigator.webdriver;
+          checks.push({
+            label: "WebDriver",
+            pass: !fp.webdriver,
+            summary: fp.webdriver ? "webdriver" : null,
+            detail: "navigator.webdriver = " + fp.webdriver,
+          });
+
+          // Plugins
+          fp.plugins_count = navigator.plugins.length;
+          fp.plugin_names = Array.from(navigator.plugins).map(function (p) {
+            return p.name;
+          });
+          checks.push({
+            label: "Plugins",
+            pass: fp.plugins_count > 0,
+            summary: "plugins=" + fp.plugins_count,
+            detail:
+              fp.plugins_count > 0
+                ? fp.plugin_names.join(", ")
+                : "No plugins detected",
+          });
+
+          // Languages
+          fp.languages = (navigator.languages || []).slice();
+          checks.push({
+            label: "Languages",
+            pass: fp.languages.length > 0,
+            summary: fp.languages.length > 0 ? fp.languages[0] : "no-lang",
+            detail:
+              fp.languages.length > 0
+                ? fp.languages.join(", ")
+                : "No languages set",
+          });
+
+          // User Agent
+          fp.user_agent = navigator.userAgent;
+          var isHeadless = /headless/i.test(fp.user_agent);
+          checks.push({
+            label: "User Agent",
+            pass: !isHeadless,
+            summary: isHeadless ? "headless-UA" : null,
+            detail: fp.user_agent,
+          });
+
+          // Platform
+          fp.platform = navigator.platform || "";
+          checks.push({
+            label: "Platform",
+            pass: true,
+            summary: null,
+            detail: fp.platform || "unknown",
+          });
+
+          // Screen
+          fp.screen_width = screen.width;
+          fp.screen_height = screen.height;
+          fp.color_depth = screen.colorDepth;
+          fp.device_pixel_ratio = window.devicePixelRatio || 1;
+          checks.push({
+            label: "Screen",
+            pass: true,
+            summary: fp.screen_width + "\u00d7" + fp.screen_height,
+            detail:
+              fp.screen_width +
+              "\u00d7" +
+              fp.screen_height +
+              ", depth=" +
+              fp.color_depth +
+              ", dpr=" +
+              fp.device_pixel_ratio,
+          });
+
+          // Canvas fingerprint
+          fp.canvas_hash_len = 0;
+          try {
+            var c = document.createElement("canvas");
+            c.width = 200;
+            c.height = 50;
+            var ctx = c.getContext("2d");
+            ctx.textBaseline = "top";
+            ctx.font = "14px Arial";
+            ctx.fillStyle = "#f60";
+            ctx.fillRect(0, 0, 200, 50);
+            ctx.fillStyle = "#069";
+            ctx.fillText("puprs-fingerprint", 2, 15);
+            fp.canvas_hash_len = c.toDataURL().length;
+          } catch (e) {}
+          checks.push({
+            label: "Canvas FP",
+            pass: fp.canvas_hash_len > 0,
+            summary: null,
+            detail: "toDataURL length = " + fp.canvas_hash_len,
+          });
+
+          // WebGL
+          fp.webgl_renderer = "";
+          try {
+            var gl = document.createElement("canvas").getContext("webgl");
+            if (gl) {
+              var dbg = gl.getExtension("WEBGL_debug_renderer_info");
+              fp.webgl_renderer = dbg
+                ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+                : gl.getParameter(gl.RENDERER);
+            }
+          } catch (e) {}
+          checks.push({
+            label: "WebGL",
+            pass: fp.webgl_renderer !== "",
+            summary: null,
+            detail: fp.webgl_renderer || "unsupported",
+          });
+
+          // Timezone
+          fp.timezone_offset = new Date().getTimezoneOffset();
+          fp.timezone_name = "";
+          try {
+            fp.timezone_name = Intl.DateTimeFormat().resolvedOptions().timeZone;
+          } catch (e) {}
+          checks.push({
+            label: "Timezone",
+            pass: true,
+            summary: null,
+            detail:
+              "offset=" +
+              fp.timezone_offset +
+              (fp.timezone_name ? " (" + fp.timezone_name + ")" : ""),
+          });
+
+          return { checks: checks, fingerprint: fp };
+        }
+
+        // Collect once on load — shared by Browser Check display and captcha
+        var browserInfo = collectBrowserInfo();
+
+        // ── Form submit ──
+        document
+          .getElementById("login-form")
+          .addEventListener("submit", function (e) {
+            e.preventDefault();
+
+            var formData = {
+              username: document.getElementById("username").value,
+              password: document.getElementById("password").value,
+              email: document.getElementById("email").value,
+              csrf_token: document.getElementById("csrf_token").value,
+              captcha_token: document.getElementById("captcha_token").value,
+            };
+
+            fetch("/api/login", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(formData),
+            })
+              .then(function (r) {
+                return r.json();
+              })
+              .then(function (data) {
+                var msg = document.getElementById("error-msg");
+                if (data.success) {
+                  msg.style.color = "#51cf66";
+                  msg.textContent = "✅ " + data.message;
+                  setTimeout(function () {
+                    window.location.href = "/dashboard";
+                  }, 1000);
+                } else {
+                  msg.style.color = "#ff6b6b";
+                  msg.textContent = "❌ " + data.message;
+                }
+              })
+              .catch(function (err) {
+                document.getElementById("error-msg").textContent =
+                  "Network error: " + err.message;
+              });
+          });
+
+        // ── Captcha Widget ──
+        var captchaState = {
+          challengeId: null,
+          targetCount: 5,
+          clicks: [],
+          verified: false,
+        };
+
+        var CAPTCHA_W = 280,
+          CAPTCHA_H = 180;
+
+        // Track mouse path specifically for captcha behavioral analysis
+        var captchaMousePath = [];
+        document.addEventListener("mousemove", function (e) {
+          if (!captchaState.verified && captchaMousePath.length < 200) {
+            captchaMousePath.push({
+              x: e.clientX,
+              y: e.clientY,
+              t: Date.now() - pageLoadTime,
+            });
+          }
+        });
+
+        document
+          .getElementById("captcha-checkbox-area")
+          .addEventListener("click", function () {
+            if (captchaState.verified) return;
+
+            var checkbox = document.getElementById("captcha-checkbox");
+            checkbox.className = "captcha-checkbox checking";
+
+            // Request challenge from server, sending behavioral + fingerprint data
+            fetch("/api/captcha/init", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                mouse_path: captchaMousePath.slice(-50),
+                page_time: Date.now() - pageLoadTime,
+                fingerprint: Object.assign({}, browserInfo.fingerprint, {
+                  key_timings: keyTimings.slice(),
+                  focus_events_count: focusEvents.length,
+                }),
+              }),
+            })
+              .then(function (r) {
+                return r.json();
+              })
+              .then(function (data) {
+                if (data.passed) {
+                  // Server approved without challenge (behavioral analysis passed)
+                  captchaState.verified = true;
+                  document.getElementById("captcha_token").value =
+                    data.captcha_token;
+                  var checkbox = document.getElementById("captcha-checkbox");
+                  checkbox.className = "captcha-checkbox checked";
+                  return;
+                }
+                captchaState.challengeId = data.challenge_id;
+                captchaState.targetCount = data.target_count || 5;
+                captchaState.clicks = [];
+                // Store challenge_id on widget for accessibility
+                document
+                  .getElementById("captcha-widget")
+                  .setAttribute("data-challenge-id", data.challenge_id);
+                showCaptchaImage(data.image, data.width, data.height);
+                document.getElementById("captcha-challenge").style.display =
+                  "block";
+                document.getElementById(
+                  "captcha-challenge-status",
+                ).textContent = "Click target 1";
+              });
+          });
+
+        function showCaptchaImage(imageBase64, width, height) {
+          var area = document.getElementById("captcha-challenge-area");
+          area.innerHTML = "";
+          // Use canvas to display the server-rendered image
+          var canvas = document.createElement("canvas");
+          canvas.id = "captcha-canvas";
+          canvas.width = width || CAPTCHA_W;
+          canvas.height = height || CAPTCHA_H;
+          area.appendChild(canvas);
+
+          var ctx = canvas.getContext("2d");
+          var img = new Image();
+          img.onload = function () {
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          };
+          img.src = "data:image/png;base64," + imageBase64;
+
+          // Attach click handler to canvas
+          canvas.onclick = function (e) {
+            if (captchaState.verified) return;
+            var rect = canvas.getBoundingClientRect();
+            var scaleX = canvas.width / rect.width;
+            var scaleY = canvas.height / rect.height;
+            var cx = (e.clientX - rect.left) * scaleX;
+            var cy = (e.clientY - rect.top) * scaleY;
+            handleCanvasClick(cx, cy);
+          };
+        }
+
+        function handleCanvasClick(cx, cy) {
+          // Client doesn't know target positions — just record click coordinates.
+          // Server will validate whether clicks hit targets in order.
+          captchaState.clicks.push({
+            x: cx,
+            y: cy,
+            time: Date.now() - pageLoadTime,
+          });
+
+          // Show click feedback dot
+          var area = document.getElementById("captcha-challenge-area");
+          var canvas = document.getElementById("captcha-canvas");
+          var rect = canvas.getBoundingClientRect();
+          var dot = document.createElement("div");
+          var cssX = (cx / canvas.width) * rect.width;
+          var cssY = (cy / canvas.height) * rect.height;
+          dot.style.cssText =
+            "position:absolute;width:12px;height:12px;border-radius:50%;" +
+            "background:#51cf66;border:2px solid #fff;pointer-events:none;" +
+            "left:" +
+            (cssX - 6) +
+            "px;top:" +
+            (cssY - 6) +
+            "px;" +
+            "box-shadow:0 0 4px rgba(81,207,102,0.6);";
+          area.appendChild(dot);
+
+          var clickNum = captchaState.clicks.length;
+          if (clickNum >= captchaState.targetCount) {
+            verifyCaptcha();
+          } else {
+            document.getElementById("captcha-challenge-status").textContent =
+              "Click target " + (clickNum + 1);
+          }
+        }
+
+        function verifyCaptcha() {
+          document.getElementById("captcha-challenge-status").textContent =
+            "Verifying...";
+
+          fetch("/api/captcha/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              challenge_id: captchaState.challengeId,
+              clicks: captchaState.clicks,
+              mouse_path: captchaMousePath.slice(-100),
+            }),
+          })
+            .then(function (r) {
+              return r.json();
+            })
+            .then(function (data) {
+              if (data.success) {
+                captchaState.verified = true;
+                document.getElementById("captcha_token").value =
+                  data.captcha_token;
+                document.getElementById("captcha-challenge").style.display =
+                  "none";
+                var checkbox = document.getElementById("captcha-checkbox");
+                checkbox.className = "captcha-checkbox checked";
+                document.getElementById(
+                  "captcha-challenge-status",
+                ).textContent = "";
+              } else {
+                document.getElementById(
+                  "captcha-challenge-status",
+                ).textContent = "Failed: " + data.message + " — Try again.";
+                resetCaptcha();
+              }
+            });
+        }
+
+        function resetCaptcha() {
+          setTimeout(function () {
+            var checkbox = document.getElementById("captcha-checkbox");
+            checkbox.className = "captcha-checkbox";
+            document.getElementById("captcha-challenge").style.display = "none";
+            captchaState.challengeId = null;
+            captchaState.clicks = [];
+          }, 1500);
+        }
+
+        // ── Browser Check display (uses shared browserInfo) ──
+        (function runLocalDetection() {
+          var checks = browserInfo.checks;
+
+          // Build summary bar (only show notable items)
+          var failCount = 0;
+          var summary = document.getElementById("detection-summary");
+          checks.forEach(function (c) {
+            if (!c.pass) failCount++;
+            if (c.summary) {
+              var span = document.createElement("span");
+              span.className = "item " + (c.pass ? "pass" : "fail");
+              span.textContent = (c.pass ? "✓ " : "✗ ") + c.summary;
+              summary.appendChild(span);
+            }
+          });
+
+          // Overall status in summary
+          var status = document.createElement("span");
+          status.className = "item " + (failCount === 0 ? "pass" : "fail");
+          status.textContent =
+            failCount === 0
+              ? "✓ All passed"
+              : failCount + " flag" + (failCount > 1 ? "s" : "");
+          summary.insertBefore(status, summary.firstChild);
+
+          // Build details table
+          var details = document.getElementById("detection-details");
+          var table = document.createElement("table");
+          checks.forEach(function (c) {
+            var tr = document.createElement("tr");
+            var tdLabel = document.createElement("td");
+            var icon = document.createElement("span");
+            icon.className = c.pass ? "pass" : "fail";
+            icon.textContent = c.pass ? "✓ " : "✗ ";
+            tdLabel.appendChild(icon);
+            tdLabel.appendChild(document.createTextNode(c.label));
+            var tdValue = document.createElement("td");
+            tdValue.textContent = c.detail;
+            tdValue.style.wordBreak = "break-all";
+            tr.appendChild(tdLabel);
+            tr.appendChild(tdValue);
+            table.appendChild(tr);
+          });
+          details.appendChild(table);
+
+          // Toggle expand/collapse
+          document
+            .getElementById("detection-bar")
+            .addEventListener("click", function () {
+              var d = document.getElementById("detection-details");
+              var t = document.getElementById("detection-toggle");
+              if (d.classList.contains("open")) {
+                d.classList.remove("open");
+                t.textContent = "▼ Details";
+              } else {
+                d.classList.add("open");
+                t.textContent = "▲ Hide";
+              }
+            });
+        })();
+
+        // ── Fetch CSRF token from server ──
+        fetch("/api/csrf")
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (data) {
+            document.getElementById("csrf_token").value = data.token;
+          });
+      })();
+    </script>
+  </body>
+</html>

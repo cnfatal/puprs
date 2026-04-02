@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dashboard</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: system-ui, sans-serif;
+        background: #0f0f23;
+        color: #e0e0e0;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 100vh;
+      }
+      .dashboard {
+        background: #1a1a2e;
+        border-radius: 12px;
+        padding: 2.5rem;
+        width: 500px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+      }
+      .dashboard h1 {
+        color: #51cf66;
+        margin-bottom: 0.5rem;
+      }
+      .dashboard .info {
+        color: #aaa;
+        margin-bottom: 1.5rem;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+        margin-bottom: 1.5rem;
+      }
+      .stat-card {
+        background: #16213e;
+        padding: 1rem;
+        border-radius: 8px;
+        text-align: center;
+      }
+      .stat-card .value {
+        font-size: 1.8rem;
+        font-weight: bold;
+        color: #00d4ff;
+      }
+      .stat-card .label {
+        font-size: 0.85rem;
+        color: #888;
+        margin-top: 0.3rem;
+      }
+      #welcome-user {
+        color: #00d4ff;
+      }
+      .logout-btn {
+        display: inline-block;
+        padding: 0.5rem 1.5rem;
+        background: #e94560;
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.9rem;
+        text-decoration: none;
+      }
+      .logout-btn:hover {
+        background: #c73e54;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="dashboard">
+      <h1>✅ Welcome, <span id="welcome-user">User</span>!</h1>
+      <p class="info">
+        You have successfully logged in. Bot detection was bypassed.
+      </p>
+      <div class="stats">
+        <div class="stat-card">
+          <div class="value" id="bot-score">0</div>
+          <div class="label">Bot Score</div>
+        </div>
+        <div class="stat-card">
+          <div class="value" id="detections">0</div>
+          <div class="label">Detections Triggered</div>
+        </div>
+        <div class="stat-card">
+          <div class="value" id="login-time">0s</div>
+          <div class="label">Login Time</div>
+        </div>
+        <div class="stat-card">
+          <div class="value" id="mouse-events">0</div>
+          <div class="label">Mouse Events</div>
+        </div>
+      </div>
+      <a href="/login" class="logout-btn">Logout</a>
+    </div>
+    <script>
+      var params = new URLSearchParams(window.location.search);
+      document.getElementById("welcome-user").textContent =
+        params.get("user") || "User";
+      document.getElementById("bot-score").textContent =
+        params.get("score") || "0";
+      document.getElementById("detections").textContent =
+        params.get("detections") || "0";
+      document.getElementById("login-time").textContent =
+        (params.get("time") || "0") + "ms";
+      document.getElementById("mouse-events").textContent =
+        params.get("mouse") || "0";
+    </script>
+  </body>
+</html>
