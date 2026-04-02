@@ -1,9 +1,14 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cookie::{Cookie, SetCookieParams};
 use crate::error::{Error, Result};
 use crate::page::Page;
+use crate::plugin::{
+    BrowserContext, ConnectOptions, LaunchOptions, PageCreatedContext, Plugin, PluginManager,
+    TargetCreatedContext,
+};
 
 /// Browser headless mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -13,76 +18,106 @@ pub enum HeadlessMode {
     /// Classic headless mode.
     #[default]
     True,
-    /// New headless mode (Chrome ≥ 112).
+    /// New headless mode (Chrome >= 112).
     New,
 }
 
 /// Configuration for launching a browser.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BrowserConfig {
-    inner: chromiumoxide::BrowserConfig,
+    launch_options: LaunchOptions,
+    plugins: Vec<Arc<dyn Plugin>>,
+}
+
+impl std::fmt::Debug for BrowserConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserConfig")
+            .field("launch_options", &self.launch_options)
+            .field("plugins_len", &self.plugins.len())
+            .finish()
+    }
 }
 
 /// Builder for [`BrowserConfig`].
 pub struct BrowserConfigBuilder {
-    inner: chromiumoxide::browser::BrowserConfigBuilder,
+    launch_options: LaunchOptions,
+    plugins: Vec<Arc<dyn Plugin>>,
 }
 
 impl BrowserConfigBuilder {
     pub fn new() -> Self {
         Self {
-            inner: chromiumoxide::BrowserConfig::builder(),
+            launch_options: LaunchOptions::default(),
+            plugins: Vec::new(),
         }
     }
 
+    /// Register a plugin to be activated when the browser starts.
+    pub fn plugin<P>(mut self, plugin: P) -> Self
+    where
+        P: Plugin + 'static,
+    {
+        self.plugins.push(Arc::new(plugin));
+        self
+    }
+
+    /// Register a plugin as an Arc trait object.
+    pub fn plugin_arc(mut self, plugin: Arc<dyn Plugin>) -> Self {
+        self.plugins.push(plugin);
+        self
+    }
+
     pub fn executable(mut self, path: impl AsRef<Path>) -> Self {
-        self.inner = self.inner.chrome_executable(path);
+        self.launch_options.executable = Some(path.as_ref().to_path_buf());
         self
     }
 
     pub fn headless(mut self, mode: HeadlessMode) -> Self {
-        self.inner = match mode {
-            HeadlessMode::False => self.inner.with_head(),
-            HeadlessMode::True => self.inner,
-            HeadlessMode::New => self.inner.new_headless_mode(),
-        };
+        self.launch_options.headless = mode;
         self
     }
 
     pub fn window_size(mut self, width: u32, height: u32) -> Self {
-        self.inner = self.inner.window_size(width, height);
+        self.launch_options.window_size = Some((width, height));
         self
     }
 
     pub fn no_sandbox(mut self) -> Self {
-        self.inner = self.inner.no_sandbox();
+        self.launch_options.no_sandbox = true;
         self
     }
 
     pub fn incognito(mut self) -> Self {
-        self.inner = self.inner.incognito();
+        self.launch_options.incognito = true;
         self
     }
 
     pub fn port(mut self, port: u16) -> Self {
-        self.inner = self.inner.port(port);
+        self.launch_options.port = Some(port);
         self
     }
 
     pub fn launch_timeout(mut self, timeout: Duration) -> Self {
-        self.inner = self.inner.launch_timeout(timeout);
+        self.launch_options.launch_timeout = Some(timeout);
+        self
+    }
+
+    /// Enable or disable request interception globally for newly created targets.
+    pub fn request_intercept(mut self, enabled: bool) -> Self {
+        self.launch_options.request_intercept = enabled;
         self
     }
 
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
-        let arg_str: String = arg.into();
-        self.inner = self.inner.arg(arg_str);
+        self.launch_options.args.push(arg.into());
         self
     }
 
     pub fn build(self) -> Result<BrowserConfig> {
-        let inner = self.inner.build().map_err(|e| Error::Launch(e.to_string()))?;
-        Ok(BrowserConfig { inner })
+        Ok(BrowserConfig {
+            launch_options: self.launch_options,
+            plugins: self.plugins,
+        })
     }
 }
 
@@ -92,11 +127,47 @@ impl Default for BrowserConfigBuilder {
     }
 }
 
+/// Configuration for connecting to an existing browser instance.
+#[derive(Clone)]
+pub struct ConnectConfig {
+    pub options: ConnectOptions,
+    pub plugins: Vec<Arc<dyn Plugin>>,
+}
+
+impl std::fmt::Debug for ConnectConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectConfig")
+            .field("options", &self.options)
+            .field("plugins_len", &self.plugins.len())
+            .finish()
+    }
+}
+
+impl ConnectConfig {
+    pub fn new(websocket_url: impl Into<String>) -> Self {
+        Self {
+            options: ConnectOptions::new(websocket_url),
+            plugins: Vec::new(),
+        }
+    }
+
+    pub fn plugin<P>(mut self, plugin: P) -> Self
+    where
+        P: Plugin + 'static,
+    {
+        self.plugins.push(Arc::new(plugin));
+        self
+    }
+}
+
 /// A running browser instance.
 ///
 /// Does **not** expose any CDP or chromiumoxide types.
 pub struct Browser {
     inner: chromiumoxide::Browser,
+    plugin_manager: PluginManager,
+    browser_context: BrowserContext,
+    request_intercept_enabled: bool,
     /// The handler must be spawned on a tokio task. We store a handle to the
     /// task here so callers don't need to manage it manually.
     handler_handle: Option<tokio::task::JoinHandle<()>>,
@@ -113,8 +184,18 @@ impl Browser {
     ///
     /// The CDP handler is automatically spawned on the current tokio runtime.
     pub async fn launch(config: BrowserConfig) -> Result<Self> {
-        let (browser, handler) =
-            chromiumoxide::Browser::launch(config.inner).await?;
+        let BrowserConfig {
+            mut launch_options,
+            plugins,
+        } = config;
+
+        let mut plugin_manager = PluginManager::from_plugins(plugins);
+        plugin_manager.resolve_dependencies_and_order()?;
+        plugin_manager.before_launch(&mut launch_options).await?;
+        plugin_manager.check_requirements_for_launch(&launch_options)?;
+
+        let inner = build_chromium_config(&launch_options)?;
+        let (browser, handler) = chromiumoxide::Browser::launch(inner).await?;
 
         let handle = tokio::spawn(async move {
             use futures::StreamExt;
@@ -122,15 +203,37 @@ impl Browser {
             while handler.next().await.is_some() {}
         });
 
+        plugin_manager
+            .on_browser_ready(BrowserContext::Launch)
+            .await?;
+
         Ok(Self {
             inner: browser,
+            plugin_manager,
+            browser_context: BrowserContext::Launch,
+            request_intercept_enabled: launch_options.request_intercept,
             handler_handle: Some(handle),
         })
     }
 
     /// Connect to an already running browser via WebSocket URL.
     pub async fn connect(url: impl Into<String>) -> Result<Self> {
-        let (browser, handler) = chromiumoxide::Browser::connect(url).await?;
+        Self::connect_with_config(ConnectConfig::new(url.into())).await
+    }
+
+    /// Connect using plugins and mutable connect options.
+    pub async fn connect_with_config(config: ConnectConfig) -> Result<Self> {
+        let ConnectConfig {
+            mut options,
+            plugins,
+        } = config;
+
+        let mut plugin_manager = PluginManager::from_plugins(plugins);
+        plugin_manager.resolve_dependencies_and_order()?;
+        plugin_manager.before_connect(&mut options).await?;
+        plugin_manager.check_requirements_for_connect()?;
+
+        let (browser, handler) = chromiumoxide::Browser::connect(options.websocket_url).await?;
 
         let handle = tokio::spawn(async move {
             use futures::StreamExt;
@@ -138,22 +241,93 @@ impl Browser {
             while handler.next().await.is_some() {}
         });
 
+        plugin_manager
+            .on_browser_ready(BrowserContext::Connect)
+            .await?;
+
         Ok(Self {
             inner: browser,
+            plugin_manager,
+            browser_context: BrowserContext::Connect,
+            request_intercept_enabled: false,
             handler_handle: Some(handle),
         })
     }
 
+    /// Register a plugin at runtime.
+    ///
+    /// Note that this affects subsequently created pages only.
+    pub async fn use_plugin<P>(&mut self, plugin: P) -> Result<()>
+    where
+        P: Plugin + 'static,
+    {
+        let plugin = Arc::new(plugin);
+        for dep in plugin.dependencies() {
+            if !self
+                .plugin_manager
+                .plugin_names()
+                .iter()
+                .any(|name| *name == dep)
+            {
+                return Err(Error::Other(format!(
+                    "plugin '{}' missing dependency '{}'",
+                    plugin.name(),
+                    dep
+                )));
+            }
+        }
+        plugin.on_browser_ready(self.browser_context).await?;
+        self.plugin_manager.register_arc(plugin);
+        self.plugin_manager.resolve_dependencies_and_order()?;
+        Ok(())
+    }
+
+    /// Return ordered plugin names currently registered in the browser.
+    pub fn plugin_names(&self) -> Vec<&'static str> {
+        self.plugin_manager.plugin_names()
+    }
+
     /// Create a new page (tab) and navigate to the given URL.
     pub async fn new_page(&self, url: impl Into<String>) -> Result<Page> {
-        let page = self.inner.new_page(url.into()).await?;
-        Ok(Page::new(page))
+        let url = url.into();
+        let page = self.inner.new_page(url.clone()).await?;
+
+        self.plugin_manager
+            .on_target_created(TargetCreatedContext {
+                browser_context: self.browser_context,
+                url,
+            })
+            .await?;
+
+        let page = Page::new(page)
+            .with_plugin_hooks(Arc::new(self.plugin_manager.clone()), self.browser_context);
+
+        if self.request_intercept_enabled {
+            page.start_request_interceptor().await?;
+        }
+
+        self.plugin_manager
+            .on_page_created(
+                &page,
+                PageCreatedContext {
+                    browser_context: self.browser_context,
+                },
+            )
+            .await?;
+
+        Ok(page)
     }
 
     /// Return all open pages.
     pub async fn pages(&self) -> Result<Vec<Page>> {
         let pages = self.inner.pages().await?;
-        Ok(pages.into_iter().map(Page::new).collect())
+        Ok(pages
+            .into_iter()
+            .map(Page::new)
+            .map(|p| {
+                p.with_plugin_hooks(Arc::new(self.plugin_manager.clone()), self.browser_context)
+            })
+            .collect())
     }
 
     /// The browser user-agent string.
@@ -214,4 +388,48 @@ impl Drop for Browser {
     fn drop(&mut self) {
         // The inner chromiumoxide Browser handles killing, so no extra logic needed.
     }
+}
+
+fn build_chromium_config(options: &LaunchOptions) -> Result<chromiumoxide::BrowserConfig> {
+    let mut builder = chromiumoxide::BrowserConfig::builder();
+
+    if let Some(path) = &options.executable {
+        builder = builder.chrome_executable(path);
+    }
+
+    builder = match options.headless {
+        HeadlessMode::False => builder.with_head(),
+        HeadlessMode::True => builder,
+        HeadlessMode::New => builder.new_headless_mode(),
+    };
+
+    if let Some((width, height)) = options.window_size {
+        builder = builder.window_size(width, height);
+    }
+
+    if options.no_sandbox {
+        builder = builder.no_sandbox();
+    }
+
+    if options.incognito {
+        builder = builder.incognito();
+    }
+
+    if let Some(port) = options.port {
+        builder = builder.port(port);
+    }
+
+    if let Some(timeout) = options.launch_timeout {
+        builder = builder.launch_timeout(timeout);
+    }
+
+    if options.request_intercept {
+        builder = builder.enable_request_intercept();
+    }
+
+    for arg in &options.args {
+        builder = builder.arg(arg.clone());
+    }
+
+    builder.build().map_err(|e| Error::Launch(e.to_string()))
 }

@@ -1,9 +1,13 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cookie::{Cookie, DeleteCookieParams, SetCookieParams};
 use crate::element::Element;
 use crate::error::Result;
+use crate::plugin::{
+    BrowserContext, InterceptedRequest, PluginManager, RequestDecision, TargetDestroyedContext,
+};
 use crate::screenshot::{PdfOptions, ScreenshotOptions};
 use crate::types::{Credentials, EvaluationResult, Metric, Point};
 use crate::wait::{PollingStrategy, WaitForFunctionOptions, WaitForSelectorOptions};
@@ -15,11 +19,105 @@ use crate::wait::{PollingStrategy, WaitForFunctionOptions, WaitForSelectorOption
 #[derive(Debug, Clone)]
 pub struct Page {
     pub(crate) inner: chromiumoxide::Page,
+    pub(crate) plugin_manager: Option<Arc<PluginManager>>,
+    pub(crate) browser_context: Option<BrowserContext>,
 }
 
 impl Page {
     pub(crate) fn new(inner: chromiumoxide::Page) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            plugin_manager: None,
+            browser_context: None,
+        }
+    }
+
+    pub(crate) fn with_plugin_hooks(
+        mut self,
+        plugin_manager: Arc<PluginManager>,
+        browser_context: BrowserContext,
+    ) -> Self {
+        self.plugin_manager = Some(plugin_manager);
+        self.browser_context = Some(browser_context);
+        self
+    }
+
+    pub(crate) async fn start_request_interceptor(&self) -> Result<()> {
+        let Some(plugin_manager) = &self.plugin_manager else {
+            return Ok(());
+        };
+
+        let mut events = self
+            .inner
+            .event_listener::<chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused>()
+            .await?;
+        let page = self.inner.clone();
+        let manager = Arc::clone(plugin_manager);
+
+        tokio::spawn(async move {
+            use base64::Engine;
+            use base64::prelude::BASE64_STANDARD;
+            use chromiumoxide::cdp::browser_protocol::fetch::{
+                ContinueRequestParams, FailRequestParams, FulfillRequestParams, HeaderEntry,
+            };
+            use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
+            use futures::StreamExt;
+
+            while let Some(event) = events.next().await {
+                if event.response_status_code.is_some() {
+                    continue;
+                }
+
+                let request = InterceptedRequest {
+                    url: event.request.url.clone(),
+                    method: event.request.method.clone(),
+                    resource_type: Some(format!("{:?}", event.resource_type).to_lowercase()),
+                };
+
+                let decision = manager
+                    .on_request(&request)
+                    .await
+                    .unwrap_or(RequestDecision::Continue);
+
+                let request_id = event.request_id.clone();
+                match decision {
+                    RequestDecision::Continue => {
+                        let _ = page.execute(ContinueRequestParams::new(request_id)).await;
+                    }
+                    RequestDecision::Abort => {
+                        let _ = page
+                            .execute(FailRequestParams::new(request_id, ErrorReason::Aborted))
+                            .await;
+                    }
+                    RequestDecision::Fulfill(fulfill) => {
+                        let mut params =
+                            FulfillRequestParams::new(request_id, i64::from(fulfill.status_code));
+
+                        if !fulfill.headers.is_empty() {
+                            params.response_headers = Some(
+                                fulfill
+                                    .headers
+                                    .into_iter()
+                                    .map(|(name, value)| HeaderEntry::new(name, value))
+                                    .collect(),
+                            );
+                        }
+
+                        if let Some(body) = fulfill.body {
+                            params.body = Some(BASE64_STANDARD.encode(body).into());
+                        }
+
+                        if let Some(response_phrase) = fulfill.response_phrase {
+                            params.response_phrase = Some(response_phrase);
+                        }
+
+                        let _ = page.execute(params).await;
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 
     // ── Navigation ──────────────────────────────────────────────────
@@ -49,7 +147,17 @@ impl Page {
 
     /// Close this page/tab.
     pub async fn close(self) -> Result<()> {
+        let target_hint = self.inner.url().await.ok().flatten();
         self.inner.close().await?;
+        if let (Some(manager), Some(browser_context)) = (&self.plugin_manager, self.browser_context)
+        {
+            manager
+                .on_target_destroyed(TargetDestroyedContext {
+                    browser_context,
+                    target_hint,
+                })
+                .await?;
+        }
         Ok(())
     }
 

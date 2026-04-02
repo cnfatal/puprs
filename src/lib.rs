@@ -31,6 +31,8 @@ pub mod element;
 pub mod error;
 pub mod locator;
 pub mod page;
+pub mod plugin;
+pub mod plugins;
 pub mod screenshot;
 pub mod types;
 pub mod wait;
@@ -38,7 +40,7 @@ pub(crate) mod wait_task;
 
 // ── Re-exports ──────────────────────────────────────────────────────
 
-pub use browser::{Browser, BrowserConfig, BrowserConfigBuilder, HeadlessMode};
+pub use browser::{Browser, BrowserConfig, BrowserConfigBuilder, ConnectConfig, HeadlessMode};
 pub use cookie::{Cookie, DeleteCookieParams, SetCookieParams};
 pub use element::Element;
 pub use error::{Error, Result};
@@ -47,6 +49,12 @@ pub use locator::{
     Visibility,
 };
 pub use page::Page;
+pub use plugin::{
+    BrowserContext, ConnectOptions, FulfillResponse, InterceptedRequest, LaunchOptions,
+    PageCreatedContext, Plugin, PluginManager, PluginRequirement, RequestDecision,
+    TargetCreatedContext, TargetDestroyedContext,
+};
+pub use plugins::{BlockResourcesPlugin, InitScriptPlugin, StealthEvasion, StealthPlugin};
 pub use screenshot::{ClipRect, ImageFormat, PdfOptions, ScreenshotOptions};
 pub use types::{
     BoundingBox, Credentials, EvaluationResult, Metric, NavigateOptions, Point, Viewport,
