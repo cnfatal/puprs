@@ -290,14 +290,9 @@ impl Browser {
     /// Create a new page (tab) and navigate to the given URL.
     pub async fn new_page(&self, url: impl Into<String>) -> Result<Page> {
         let url = url.into();
-        let page = self.inner.new_page(url.clone()).await?;
-
-        self.plugin_manager
-            .on_target_created(TargetCreatedContext {
-                browser_context: self.browser_context,
-                url,
-            })
-            .await?;
+        // Create a blank page first so that plugin hooks (e.g. init scripts)
+        // are registered *before* navigating to the target URL.
+        let page = self.inner.new_page("about:blank").await?;
 
         let page = Page::new(page)
             .with_plugin_hooks(Arc::new(self.plugin_manager.clone()), self.browser_context);
@@ -314,6 +309,17 @@ impl Browser {
                 },
             )
             .await?;
+
+        self.plugin_manager
+            .on_target_created(TargetCreatedContext {
+                browser_context: self.browser_context,
+                url: url.clone(),
+            })
+            .await?;
+
+        // Now navigate — init scripts registered by plugins will execute
+        // before page scripts run.
+        page.goto(&url).await?;
 
         Ok(page)
     }
