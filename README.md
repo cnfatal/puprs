@@ -2,6 +2,15 @@
 
 Puppeteer-inspired high-level browser automation SDK for Rust.
 
+Rust browser automation with Puppeteer-like ergonomics, stronger type safety, and resilient waiting behavior.
+
+## Why puprs
+
+- Locator-first API: auto-wait, auto-retry, and precondition checks for less flaky scripts
+- Navigation-resilient waits: waiting survives page transitions and reattaches automatically
+- No CDP leak: public API stays stable while backend internals can evolve
+- Built-in stealth + plugin system: composable evasions and extensibility
+
 Built on top of [chromiumoxide](https://github.com/mattsse/chromiumoxide) (CDP), puprs provides a **clean, ergonomic API** with no CDP types leaking into the public surface. If the backend changes, your code stays the same.
 
 ## Highlights
