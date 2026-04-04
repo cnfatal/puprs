@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use crate::element::Element;
 use crate::error::{Error, Result};
+use crate::frame_handle::FrameHandle;
 use crate::page::Page;
-use crate::types::EvaluationResult;
+use crate::types::{ClickOptions, EvaluationResult};
 use crate::wait::WaitForSelectorOptions;
 
 /// Retry delay between locator attempts (matches puppeteer's `RETRY_DELAY`).
@@ -75,6 +76,35 @@ pub struct ScrollOptions {
     pub scroll_left: Option<f64>,
 }
 
+// ─── LocatorContext ─────────────────────────────────────────────────
+
+/// The execution context for a locator — either a full Page or a specific Frame.
+#[derive(Debug, Clone)]
+enum LocatorContext {
+    Page(Page),
+    Frame(FrameHandle),
+}
+
+impl LocatorContext {
+    fn page(&self) -> &Page {
+        match self {
+            Self::Page(p) => p,
+            Self::Frame(f) => f.page(),
+        }
+    }
+
+    async fn wait_for_selector(
+        &self,
+        selector: &str,
+        options: WaitForSelectorOptions,
+    ) -> Result<Option<Element>> {
+        match self {
+            Self::Page(p) => p.wait_for_selector(selector, options).await,
+            Self::Frame(f) => f.wait_for_selector(selector, options).await,
+        }
+    }
+}
+
 // ─── NodeLocator ────────────────────────────────────────────────────
 
 /// Locate elements by CSS selector or from an existing handle.
@@ -93,7 +123,7 @@ pub struct ScrollOptions {
 ///   `_wait()`.
 #[derive(Debug, Clone)]
 pub struct NodeLocator {
-    page: Page,
+    ctx: LocatorContext,
     source: LocatorSource,
     options: LocatorOptions,
     /// JS predicate filters. Each predicate receives the element as its first
@@ -113,7 +143,16 @@ enum LocatorSource {
 impl NodeLocator {
     pub(crate) fn new(page: Page, selector: impl Into<String>) -> Self {
         Self {
-            page,
+            ctx: LocatorContext::Page(page),
+            source: LocatorSource::Selector(selector.into()),
+            options: LocatorOptions::default(),
+            filters: Vec::new(),
+        }
+    }
+
+    pub(crate) fn new_for_frame(frame: FrameHandle, selector: impl Into<String>) -> Self {
+        Self {
+            ctx: LocatorContext::Frame(frame),
             source: LocatorSource::Selector(selector.into()),
             options: LocatorOptions::default(),
             filters: Vec::new(),
@@ -123,7 +162,7 @@ impl NodeLocator {
     /// Create a locator from an existing element handle.
     pub fn from_handle(page: Page, element: Element) -> Self {
         Self {
-            page,
+            ctx: LocatorContext::Page(page),
             source: LocatorSource::Handle(element),
             options: LocatorOptions::default(),
             filters: Vec::new(),
@@ -200,9 +239,14 @@ impl NodeLocator {
     /// Pipeline: `_wait → [viewport, stable_bbox, enabled] → click`
     /// with outer retry on retryable errors.
     pub async fn click(&self) -> Result<()> {
+        self.click_with(ClickOptions::default()).await
+    }
+
+    /// Click with options (button, count, delay, offset).
+    pub async fn click_with(&self, options: ClickOptions) -> Result<()> {
         let deadline = tokio::time::Instant::now() + self.options.timeout;
         loop {
-            match self.try_click(deadline).await {
+            match self.try_click_with(deadline, &options).await {
                 Ok(()) => return Ok(()),
                 Err(e) if is_retryable(&e) && tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(RETRY_DELAY).await;
@@ -266,7 +310,7 @@ impl NodeLocator {
     async fn wait_for_element(&self) -> Result<Element> {
         match &self.source {
             LocatorSource::Selector(selector) => self
-                .page
+                .ctx
                 .wait_for_selector(
                     selector,
                     WaitForSelectorOptions {
@@ -324,10 +368,14 @@ impl NodeLocator {
 
     // ── Internal: action attempts ───────────────────────────────────
 
-    async fn try_click(&self, deadline: tokio::time::Instant) -> Result<()> {
+    async fn try_click_with(
+        &self,
+        deadline: tokio::time::Instant,
+        options: &ClickOptions,
+    ) -> Result<()> {
         let el = self.wait_and_check().await?;
         apply_action_preconditions(&el, &self.options, deadline, true).await?;
-        el.click().await?;
+        el.click_with(options.clone()).await?;
         Ok(())
     }
 
@@ -367,7 +415,7 @@ impl NodeLocator {
 /// Polls a JS predicate via `evaluate` until it returns truthy.
 #[derive(Debug, Clone)]
 pub struct FunctionLocator {
-    page: Page,
+    ctx: LocatorContext,
     func: String,
     options: LocatorOptions,
 }
@@ -375,7 +423,15 @@ pub struct FunctionLocator {
 impl FunctionLocator {
     pub(crate) fn new(page: Page, func: impl Into<String>) -> Self {
         Self {
-            page,
+            ctx: LocatorContext::Page(page),
+            func: func.into(),
+            options: LocatorOptions::default(),
+        }
+    }
+
+    pub(crate) fn new_for_frame(frame: FrameHandle, func: impl Into<String>) -> Self {
+        Self {
+            ctx: LocatorContext::Frame(frame),
             func: func.into(),
             options: LocatorOptions::default(),
         }
@@ -413,7 +469,7 @@ impl FunctionLocator {
             timeout: Some(self.options.timeout),
             args: Vec::new(),
         };
-        self.page.wait_for_function(&self.func, opts).await
+        self.ctx.page().wait_for_function(&self.func, opts).await
     }
 }
 
@@ -465,6 +521,32 @@ impl RaceLocator {
         let el = self.wait_handle().await?;
         el.click().await?;
         Ok(())
+    }
+
+    /// Click the first element that matches, with options.
+    pub async fn click_with(&self, options: ClickOptions) -> Result<()> {
+        let el = self.wait_handle().await?;
+        el.click_with(options).await?;
+        Ok(())
+    }
+
+    /// Fill the first matching input element.
+    pub async fn fill(&self, value: impl Into<String>) -> Result<()> {
+        let el = self.wait_handle().await?;
+        fill_element(&el, &value.into(), &FillOptions::default()).await
+    }
+
+    /// Hover over the first matching element.
+    pub async fn hover(&self) -> Result<()> {
+        let el = self.wait_handle().await?;
+        el.hover().await?;
+        Ok(())
+    }
+
+    /// Scroll the first matching element.
+    pub async fn scroll(&self, options: ScrollOptions) -> Result<()> {
+        let el = self.wait_handle().await?;
+        scroll_element(&el, &options).await
     }
 }
 

@@ -44,10 +44,10 @@ impl ClipRect {
 }
 
 impl From<ScreenshotOptions>
-    for chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotParams
+    for crate::cdp::browser_protocol::page::CaptureScreenshotParams
 {
     fn from(o: ScreenshotOptions) -> Self {
-        use chromiumoxide::cdp::browser_protocol::page::{
+        use crate::cdp::browser_protocol::page::{
             CaptureScreenshotFormat, CaptureScreenshotParams, Viewport,
         };
 
@@ -94,9 +94,9 @@ pub struct PdfOptions {
     pub prefer_css_page_size: Option<bool>,
 }
 
-impl From<PdfOptions> for chromiumoxide::cdp::browser_protocol::page::PrintToPdfParams {
+impl From<PdfOptions> for crate::cdp::browser_protocol::page::PrintToPdfParams {
     fn from(o: PdfOptions) -> Self {
-        let mut p = chromiumoxide::cdp::browser_protocol::page::PrintToPdfParams::default();
+        let mut p = crate::cdp::browser_protocol::page::PrintToPdfParams::default();
         p.landscape = o.landscape;
         p.display_header_footer = o.display_header_footer;
         p.print_background = o.print_background;

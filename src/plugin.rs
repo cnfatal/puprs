@@ -1,85 +1,22 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::browser::{ConnectOptions, LaunchOptions};
 use crate::error::Result;
 use crate::page::Page;
-
-/// Browser lifecycle context available to plugins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrowserContext {
-    Launch,
-    Connect,
-}
-
-/// Public launch options available to plugins before browser startup.
-#[derive(Debug, Clone)]
-pub struct LaunchOptions {
-    pub executable: Option<std::path::PathBuf>,
-    pub headless: crate::browser::HeadlessMode,
-    pub window_size: Option<(u32, u32)>,
-    pub no_sandbox: bool,
-    pub incognito: bool,
-    pub port: Option<u16>,
-    pub launch_timeout: Option<Duration>,
-    pub args: Vec<String>,
-    pub request_intercept: bool,
-}
-
-impl Default for LaunchOptions {
-    fn default() -> Self {
-        Self {
-            executable: None,
-            headless: crate::browser::HeadlessMode::True,
-            window_size: None,
-            no_sandbox: false,
-            incognito: false,
-            port: None,
-            launch_timeout: None,
-            args: Vec::new(),
-            request_intercept: false,
-        }
-    }
-}
-
-/// Public connect options available to plugins before attaching.
-#[derive(Debug, Clone)]
-pub struct ConnectOptions {
-    pub websocket_url: String,
-}
-
-impl ConnectOptions {
-    pub fn new(websocket_url: impl Into<String>) -> Self {
-        Self {
-            websocket_url: websocket_url.into(),
-        }
-    }
-}
 
 /// Lifecycle metadata for target creation hooks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetCreatedContext {
-    pub browser_context: BrowserContext,
+    pub target_id: String,
     pub url: String,
 }
 
 /// Lifecycle metadata for target destruction hooks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetDestroyedContext {
-    pub browser_context: BrowserContext,
     pub target_hint: Option<String>,
-}
-
-/// Plugin requirement declarations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginRequirement {
-    /// Prefer this plugin to execute after others.
-    RunLast,
-    /// Plugin is only valid for browser launch flow.
-    Launch,
-    /// Plugin requires visible (non-headless) mode.
-    Headful,
 }
 
 /// Request metadata exposed to plugins without CDP types.
@@ -140,14 +77,12 @@ impl FulfillResponse {
 }
 
 /// Runtime metadata for page creation hooks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageCreatedContext {
-    pub browser_context: BrowserContext,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PageCreatedContext {}
 
 /// Trait implemented by all puprs plugins.
 ///
-/// Hooks are called sequentially in priority order. Lower values run first.
+/// Hooks are called sequentially in plugin registration order.
 #[async_trait]
 pub trait Plugin: Send + Sync {
     /// Unique plugin name used in logs and diagnostics.
@@ -156,11 +91,6 @@ pub trait Plugin: Send + Sync {
     /// Hook execution priority. Lower means earlier.
     fn priority(&self) -> i32 {
         0
-    }
-
-    /// Optional runtime requirements.
-    fn requirements(&self) -> Vec<PluginRequirement> {
-        Vec::new()
     }
 
     /// Optional plugin dependencies by plugin name.
@@ -179,7 +109,7 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Called after Browser is launched or connected.
-    async fn on_browser_ready(&self, _ctx: BrowserContext) -> Result<()> {
+    async fn on_browser_ready(&self) -> Result<()> {
         Ok(())
     }
 
@@ -224,64 +154,21 @@ impl PluginManager {
     }
 
     pub fn from_plugins(plugins: Vec<Arc<dyn Plugin>>) -> Self {
-        let mut this = Self { plugins };
-        this.sort_plugins();
-        this
+        Self { plugins }
     }
 
-    pub fn register_arc(&mut self, plugin: Arc<dyn Plugin>) {
-        self.plugins.push(plugin);
-        self.sort_plugins();
-    }
-
-    pub fn register<P>(&mut self, plugin: P)
+    pub async fn register<P>(&mut self, plugin: P) -> Result<()>
     where
         P: Plugin + 'static,
     {
-        self.register_arc(Arc::new(plugin));
+        self.validate(&plugin)?;
+        let plugin = Arc::new(plugin);
+        self.plugins.push(plugin);
+        Ok(())
     }
 
     pub fn plugin_names(&self) -> Vec<&'static str> {
         self.plugins.iter().map(|p| p.name()).collect()
-    }
-
-    pub fn resolve_dependencies_and_order(&mut self) -> Result<()> {
-        self.validate_dependencies()?;
-        self.sort_plugins();
-        Ok(())
-    }
-
-    pub fn check_requirements_for_launch(&self, options: &LaunchOptions) -> Result<()> {
-        for plugin in &self.plugins {
-            for req in plugin.requirements() {
-                match req {
-                    PluginRequirement::Headful => {
-                        if options.headless != crate::browser::HeadlessMode::False {
-                            return Err(crate::error::Error::Other(format!(
-                                "plugin '{}' requires headful mode",
-                                plugin.name()
-                            )));
-                        }
-                    }
-                    PluginRequirement::Launch | PluginRequirement::RunLast => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn check_requirements_for_connect(&self) -> Result<()> {
-        for plugin in &self.plugins {
-            for req in plugin.requirements() {
-                if req == PluginRequirement::Launch {
-                    return Err(crate::error::Error::Other(format!(
-                        "plugin '{}' only supports launch()",
-                        plugin.name()
-                    )));
-                }
-            }
-        }
-        Ok(())
     }
 
     pub async fn before_launch(&self, options: &mut LaunchOptions) -> Result<()> {
@@ -298,9 +185,9 @@ impl PluginManager {
         Ok(())
     }
 
-    pub async fn on_browser_ready(&self, ctx: BrowserContext) -> Result<()> {
+    pub async fn on_browser_ready(&self) -> Result<()> {
         for plugin in &self.plugins {
-            plugin.on_browser_ready(ctx).await?;
+            plugin.on_browser_ready().await?;
         }
         Ok(())
     }
@@ -337,40 +224,19 @@ impl PluginManager {
         Ok(decision)
     }
 
-    pub fn has_plugins(&self) -> bool {
-        !self.plugins.is_empty()
-    }
-
-    fn sort_plugins(&mut self) {
-        self.plugins.sort_by_key(|p| {
-            let run_last = p
-                .requirements()
-                .iter()
-                .any(|r| *r == PluginRequirement::RunLast);
-            (run_last, p.priority(), p.name())
-        });
-    }
-
-    fn validate_dependencies(&self) -> Result<()> {
+    fn validate(&self, plugin: &dyn Plugin) -> Result<()> {
         let names = self.plugin_names();
-        for plugin in &self.plugins {
-            for dep in plugin.dependencies() {
-                if !names.iter().any(|name| *name == dep) {
-                    return Err(crate::error::Error::Other(format!(
-                        "plugin '{}' missing dependency '{}'",
-                        plugin.name(),
-                        dep
-                    )));
-                }
+
+        for dep in plugin.dependencies() {
+            if !names.iter().any(|name| *name == dep) {
+                return Err(crate::error::Error::Other(format!(
+                    "plugin '{}' missing dependency '{}'",
+                    plugin.name(),
+                    dep
+                )));
             }
         }
+
         Ok(())
     }
-}
-
-/// Backward-compatible location for built-in plugins.
-pub mod builtins {
-    pub use crate::plugins::{
-        BlockResourcesPlugin, InitScriptPlugin, StealthEvasion, StealthPlugin,
-    };
 }

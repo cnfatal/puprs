@@ -14,8 +14,8 @@ pub struct Cookie {
     pub same_site: Option<String>,
 }
 
-impl From<chromiumoxide::cdp::browser_protocol::network::Cookie> for Cookie {
-    fn from(c: chromiumoxide::cdp::browser_protocol::network::Cookie) -> Self {
+impl From<crate::cdp::browser_protocol::network::Cookie> for Cookie {
+    fn from(c: crate::cdp::browser_protocol::network::Cookie) -> Self {
         Self {
             name: c.name,
             value: c.value,
@@ -74,10 +74,10 @@ impl SetCookieParams {
     }
 }
 
-impl From<SetCookieParams> for chromiumoxide::cdp::browser_protocol::network::CookieParam {
+impl From<SetCookieParams> for crate::cdp::browser_protocol::network::CookieParam {
     fn from(p: SetCookieParams) -> Self {
         let mut cp =
-            chromiumoxide::cdp::browser_protocol::network::CookieParam::new(p.name, p.value);
+            crate::cdp::browser_protocol::network::CookieParam::new(p.name, p.value);
         cp.url = p.url;
         cp.domain = p.domain;
         cp.path = p.path;
@@ -85,7 +85,7 @@ impl From<SetCookieParams> for chromiumoxide::cdp::browser_protocol::network::Co
         cp.http_only = p.http_only;
         cp.expires = p
             .expires
-            .map(|e| chromiumoxide::cdp::browser_protocol::network::TimeSinceEpoch::new(e));
+            .map(|e| crate::cdp::browser_protocol::network::TimeSinceEpoch::new(e));
         cp
     }
 }
@@ -111,11 +111,11 @@ impl DeleteCookieParams {
 }
 
 impl From<DeleteCookieParams>
-    for chromiumoxide::cdp::browser_protocol::network::DeleteCookiesParams
+    for crate::cdp::browser_protocol::network::DeleteCookiesParams
 {
     fn from(p: DeleteCookieParams) -> Self {
         let mut dp =
-            chromiumoxide::cdp::browser_protocol::network::DeleteCookiesParams::new(p.name);
+            crate::cdp::browser_protocol::network::DeleteCookiesParams::new(p.name);
         dp.url = p.url;
         dp.domain = p.domain;
         dp.path = p.path;

@@ -1,14 +1,23 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+
+use crate::cdp::browser_protocol::browser::{CloseParams, GetVersionParams};
+use crate::cdp::browser_protocol::network::{
+    GetCookiesParams as NetworkGetCookiesParams, SetCookiesParams as NetworkSetCookiesParams,
+};
+use crate::cdp::browser_protocol::storage::ClearCookiesParams;
+
+use crate::browser_context::BrowserContext;
 use crate::cookie::{Cookie, SetCookieParams};
 use crate::error::{Error, Result};
 use crate::page::Page;
-use crate::plugin::{
-    BrowserContext, ConnectOptions, LaunchOptions, PageCreatedContext, Plugin, PluginManager,
-    TargetCreatedContext,
-};
+use crate::plugin::{Plugin, PluginManager};
+use crate::target::TargetManager;
+use crate::transport::Transport;
 
 /// Browser headless mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -22,131 +31,284 @@ pub enum HeadlessMode {
     New,
 }
 
-/// Configuration for launching a browser.
-#[derive(Clone)]
-pub struct BrowserConfig {
-    launch_options: LaunchOptions,
-    plugins: Vec<Arc<dyn Plugin>>,
+// ── BrowserProcess ──────────────────────────────────────────────────
+
+/// Manages the lifecycle of a locally spawned browser process.
+///
+/// Created only by `BrowserLauncher`. Handles process shutdown and
+/// temporary directory cleanup. Implements `Drop` as a safety net.
+struct BrowserProcess {
+    child: Child,
+    ws_url: String,
+    temp_user_data_dir: Option<PathBuf>,
 }
 
-impl std::fmt::Debug for BrowserConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BrowserConfig")
-            .field("launch_options", &self.launch_options)
-            .field("plugins_len", &self.plugins.len())
-            .finish()
+impl BrowserProcess {
+    /// Spawn a Chrome process and parse the WebSocket URL from stderr.
+    async fn spawn(
+        executable: PathBuf,
+        args: Vec<String>,
+        temp_user_data_dir: Option<PathBuf>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let mut child = Command::new(&executable)
+            .args(&args)
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| Error::Launch(format!("failed to spawn: {e}")))?;
+
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::Launch("no stderr".into()))?;
+
+        let ws_url =
+            match tokio::time::timeout(timeout, read_ws_url_from_stderr(BufReader::new(stderr)))
+                .await
+            {
+                Ok(Ok(url)) => url,
+                _ => {
+                    let _ = child.kill().await;
+                    return Err(Error::Launch("timed out waiting for ws url".into()));
+                }
+            };
+
+        Ok(Self {
+            child,
+            ws_url,
+            temp_user_data_dir,
+        })
+    }
+
+    /// Wait for the child process to exit, then clean up temp resources.
+    async fn shutdown(&mut self) {
+        let _ = self.child.wait().await;
+        self.cleanup().await;
+    }
+
+    async fn cleanup(&self) {
+        if let Some(ref path) = self.temp_user_data_dir {
+            let _ = tokio::fs::remove_dir_all(path).await;
+        }
     }
 }
 
-/// Builder for [`BrowserConfig`].
-pub struct BrowserConfigBuilder {
-    launch_options: LaunchOptions,
+impl Drop for BrowserProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        if let Some(ref path) = self.temp_user_data_dir {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+// ── LaunchOptions ───────────────────────────────────────────────────
+
+/// A pure data manifest passed to plugins before launch.
+#[derive(Clone, Debug, Default)]
+pub struct LaunchOptions {
+    pub executable: Option<PathBuf>,
+    pub args: Vec<(String, Option<String>)>,
+    pub launch_timeout: Option<Duration>,
+}
+
+// ── BrowserLauncher ─────────────────────────────────────────────────
+
+/// Builder for launching a local browser process.
+pub struct BrowserLauncher {
+    options: LaunchOptions,
     plugins: Vec<Arc<dyn Plugin>>,
 }
 
-impl BrowserConfigBuilder {
-    pub fn new() -> Self {
+impl Default for BrowserLauncher {
+    fn default() -> Self {
+        let mut options = LaunchOptions::default();
+
+        // Populate baseline defaults
+        options.args.extend(vec![
+            ("--disable-background-networking".to_string(), None),
+            ("--disable-background-timer-throttling".to_string(), None),
+            ("--disable-backgrounding-occluded-windows".to_string(), None),
+            ("--disable-breakpad".to_string(), None),
+            ("--disable-default-apps".to_string(), None),
+            ("--disable-dev-shm-usage".to_string(), None),
+            ("--disable-popup-blocking".to_string(), None),
+            ("--disable-sync".to_string(), None),
+            ("--metrics-recording-only".to_string(), None),
+            ("--no-first-run".to_string(), None),
+            ("--no-default-browser-check".to_string(), None),
+            ("--password-store".to_string(), Some("basic".to_string())),
+            ("--use-mock-keychain".to_string(), None),
+            ("--lang".to_string(), Some("en_US".to_string())),
+            ("--remote-debugging-port".to_string(), Some("0".to_string())),
+            ("--mute-audio".to_string(), None),
+            ("--hide-scrollbars".to_string(), None),
+            ("--disable-extensions".to_string(), None),
+            ("--headless".to_string(), None),
+        ]);
+
         Self {
-            launch_options: LaunchOptions::default(),
+            options,
             plugins: Vec::new(),
         }
     }
+}
 
-    /// Register a plugin to be activated when the browser starts.
-    pub fn plugin<P>(mut self, plugin: P) -> Self
-    where
-        P: Plugin + 'static,
-    {
-        self.plugins.push(Arc::new(plugin));
-        self
-    }
-
-    /// Register a plugin as an Arc trait object.
-    pub fn plugin_arc(mut self, plugin: Arc<dyn Plugin>) -> Self {
-        self.plugins.push(plugin);
-        self
+impl BrowserLauncher {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn executable(mut self, path: impl AsRef<Path>) -> Self {
-        self.launch_options.executable = Some(path.as_ref().to_path_buf());
-        self
-    }
-
-    pub fn headless(mut self, mode: HeadlessMode) -> Self {
-        self.launch_options.headless = mode;
-        self
-    }
-
-    pub fn window_size(mut self, width: u32, height: u32) -> Self {
-        self.launch_options.window_size = Some((width, height));
-        self
-    }
-
-    pub fn no_sandbox(mut self) -> Self {
-        self.launch_options.no_sandbox = true;
-        self
-    }
-
-    pub fn incognito(mut self) -> Self {
-        self.launch_options.incognito = true;
-        self
-    }
-
-    pub fn port(mut self, port: u16) -> Self {
-        self.launch_options.port = Some(port);
-        self
-    }
-
-    pub fn launch_timeout(mut self, timeout: Duration) -> Self {
-        self.launch_options.launch_timeout = Some(timeout);
-        self
-    }
-
-    /// Enable or disable request interception globally for newly created targets.
-    pub fn request_intercept(mut self, enabled: bool) -> Self {
-        self.launch_options.request_intercept = enabled;
+        self.options.executable = Some(path.as_ref().to_path_buf());
         self
     }
 
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
-        self.launch_options.args.push(arg.into());
+        let arg_str = arg.into();
+        if let Some((k, v)) = arg_str.split_once('=') {
+            self.options.args.push((k.to_string(), Some(v.to_string())));
+        } else {
+            self.options.args.push((arg_str, None));
+        }
         self
     }
 
-    pub fn build(self) -> Result<BrowserConfig> {
-        Ok(BrowserConfig {
-            launch_options: self.launch_options,
-            plugins: self.plugins,
+    pub fn headless(mut self, mode: HeadlessMode) -> Self {
+        match mode {
+            HeadlessMode::False => {
+                self.options.args.retain(|(k, _)| k != "--headless");
+            }
+            HeadlessMode::True => {
+                self.options.args.push(("--headless".to_string(), None));
+            }
+            HeadlessMode::New => {
+                self.options
+                    .args
+                    .push(("--headless".to_string(), Some("new".to_string())));
+            }
+        }
+        self
+    }
+
+    pub fn user_data_dir(mut self, path: impl AsRef<Path>) -> Self {
+        self.options.args.push((
+            "--user-data-dir".to_string(),
+            Some(path.as_ref().to_string_lossy().to_string()),
+        ));
+        self
+    }
+
+    pub fn launch_timeout(mut self, timeout: Duration) -> Self {
+        self.options.launch_timeout = Some(timeout);
+        self
+    }
+
+    pub fn no_sandbox(mut self) -> Self {
+        self.options.args.push(("--no-sandbox".to_string(), None));
+        self.options
+            .args
+            .push(("--disable-setuid-sandbox".to_string(), None));
+        self
+    }
+
+    pub fn plugin<P>(mut self, plugin: P) -> Self
+    where
+        P: Plugin + 'static,
+    {
+        self.plugins.push(Arc::new(plugin));
+        self
+    }
+
+    /// Launch the browser process, connect, and return a `Browser`.
+    pub async fn launch(mut self) -> Result<Browser> {
+        let plugin_manager = PluginManager::from_plugins(self.plugins.clone());
+        plugin_manager.before_launch(&mut self.options).await?;
+
+        // Resolve executable
+        let executable = if let Some(path) = &self.options.executable {
+            path.clone()
+        } else {
+            crate::detection::default_executable(crate::detection::DetectionOptions::default())
+                .map_err(Error::Launch)?
+        };
+        let executable = dunce::canonicalize(&executable).unwrap_or(executable);
+
+        // Resolve user-data-dir: inject a temp dir if none was provided
+        let has_user_data_dir = self
+            .options
+            .args
+            .iter()
+            .any(|(k, _)| k == "--user-data-dir");
+
+        let temp_dir = if has_user_data_dir {
+            None
+        } else {
+            let path = std::env::temp_dir().join(format!("puprs-{}", std::process::id()));
+            self.options.args.push((
+                "--user-data-dir".to_string(),
+                Some(path.to_string_lossy().to_string()),
+            ));
+            Some(path)
+        };
+
+        // Flatten args to strings
+        let args_strings: Vec<String> = self
+            .options
+            .args
+            .iter()
+            .map(|(k, v)| match v {
+                Some(val) => format!("{}={}", k, val),
+                None => k.clone(),
+            })
+            .collect();
+
+        let timeout = self
+            .options
+            .launch_timeout
+            .unwrap_or(Duration::from_secs(30));
+
+        // Spawn process
+        let process = BrowserProcess::spawn(executable, args_strings, temp_dir, timeout).await?;
+        let ws_url = process.ws_url.clone();
+
+        // Connect transport
+        let (transport, transport_handle) = Transport::connect(&ws_url).await?;
+        let target_manager = TargetManager::create(transport, Some(Arc::new(plugin_manager.clone()))).await?;
+
+        plugin_manager.on_browser_ready().await?;
+
+        Ok(Browser {
+            target_manager,
+            plugin_manager,
+            process: Some(process),
+            debug_ws_url: ws_url,
+            transport_handle: Some(transport_handle),
         })
     }
 }
 
-impl Default for BrowserConfigBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+// ── BrowserConnector ────────────────────────────────────────────────
+
+/// Builder for connecting to an already-running browser.
+pub struct BrowserConnector {
+    options: ConnectOptions,
+    plugins: Vec<Arc<dyn Plugin>>,
 }
 
-/// Configuration for connecting to an existing browser instance.
-#[derive(Clone)]
-pub struct ConnectConfig {
-    pub options: ConnectOptions,
-    pub plugins: Vec<Arc<dyn Plugin>>,
+/// Data manifest passed to plugins before connection.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectOptions {
+    pub websocket_url: String,
 }
 
-impl std::fmt::Debug for ConnectConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectConfig")
-            .field("options", &self.options)
-            .field("plugins_len", &self.plugins.len())
-            .finish()
-    }
-}
-
-impl ConnectConfig {
-    pub fn new(websocket_url: impl Into<String>) -> Self {
+impl BrowserConnector {
+    pub fn new(url: impl Into<String>) -> Self {
         Self {
-            options: ConnectOptions::new(websocket_url),
+            options: ConnectOptions {
+                websocket_url: url.into(),
+            },
             plugins: Vec::new(),
         }
     }
@@ -158,284 +320,174 @@ impl ConnectConfig {
         self.plugins.push(Arc::new(plugin));
         self
     }
+
+    pub async fn connect(mut self) -> Result<Browser> {
+        let plugin_manager = PluginManager::from_plugins(self.plugins.clone());
+        plugin_manager.before_connect(&mut self.options).await?;
+
+        let (transport, transport_handle) = Transport::connect(&self.options.websocket_url).await?;
+        let target_manager = TargetManager::create(transport, Some(Arc::new(plugin_manager.clone()))).await?;
+
+        plugin_manager.on_browser_ready().await?;
+
+        Ok(Browser {
+            target_manager,
+            plugin_manager,
+            process: None,
+            debug_ws_url: self.options.websocket_url.clone(),
+            transport_handle: Some(transport_handle),
+        })
+    }
 }
 
+// ── Browser ─────────────────────────────────────────────────────────
+
 /// A running browser instance.
-///
-/// Does **not** expose any CDP or chromiumoxide types.
 pub struct Browser {
-    inner: chromiumoxide::Browser,
+    target_manager: TargetManager,
     plugin_manager: PluginManager,
-    browser_context: BrowserContext,
-    request_intercept_enabled: bool,
-    /// The handler must be spawned on a tokio task. We store a handle to the
-    /// task here so callers don't need to manage it manually.
-    handler_handle: Option<tokio::task::JoinHandle<()>>,
+    process: Option<BrowserProcess>,
+    debug_ws_url: String,
+    transport_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Browser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Browser").finish()
+        f.debug_struct("Browser")
+            .field("ws_url", &self.debug_ws_url)
+            .finish()
     }
 }
 
 impl Browser {
-    /// Launch a new browser with the given configuration.
-    ///
-    /// The CDP handler is automatically spawned on the current tokio runtime.
-    pub async fn launch(config: BrowserConfig) -> Result<Self> {
-        let BrowserConfig {
-            mut launch_options,
-            plugins,
-        } = config;
-
-        let mut plugin_manager = PluginManager::from_plugins(plugins);
-        plugin_manager.resolve_dependencies_and_order()?;
-        plugin_manager.before_launch(&mut launch_options).await?;
-        plugin_manager.check_requirements_for_launch(&launch_options)?;
-
-        let inner = build_chromium_config(&launch_options)?;
-        let (browser, handler) = chromiumoxide::Browser::launch(inner).await?;
-
-        let handle = tokio::spawn(async move {
-            use futures::StreamExt;
-            futures::pin_mut!(handler);
-            while handler.next().await.is_some() {}
-        });
-
-        plugin_manager
-            .on_browser_ready(BrowserContext::Launch)
-            .await?;
-
-        Ok(Self {
-            inner: browser,
-            plugin_manager,
-            browser_context: BrowserContext::Launch,
-            request_intercept_enabled: launch_options.request_intercept,
-            handler_handle: Some(handle),
-        })
+    pub fn plugins(&mut self) -> &mut PluginManager {
+        &mut self.plugin_manager
     }
 
-    /// Connect to an already running browser via WebSocket URL.
-    pub async fn connect(url: impl Into<String>) -> Result<Self> {
-        Self::connect_with_config(ConnectConfig::new(url.into())).await
+    pub async fn new_page(&self) -> Result<Page> {
+        Page::create(&self.target_manager, Some(Arc::new(self.plugin_manager.clone()))).await
     }
 
-    /// Connect using plugins and mutable connect options.
-    pub async fn connect_with_config(config: ConnectConfig) -> Result<Self> {
-        let ConnectConfig {
-            mut options,
-            plugins,
-        } = config;
-
-        let mut plugin_manager = PluginManager::from_plugins(plugins);
-        plugin_manager.resolve_dependencies_and_order()?;
-        plugin_manager.before_connect(&mut options).await?;
-        plugin_manager.check_requirements_for_connect()?;
-
-        let (browser, handler) = chromiumoxide::Browser::connect(options.websocket_url).await?;
-
-        let handle = tokio::spawn(async move {
-            use futures::StreamExt;
-            futures::pin_mut!(handler);
-            while handler.next().await.is_some() {}
-        });
-
-        plugin_manager
-            .on_browser_ready(BrowserContext::Connect)
-            .await?;
-
-        Ok(Self {
-            inner: browser,
-            plugin_manager,
-            browser_context: BrowserContext::Connect,
-            request_intercept_enabled: false,
-            handler_handle: Some(handle),
-        })
-    }
-
-    /// Register a plugin at runtime.
-    ///
-    /// Note that this affects subsequently created pages only.
-    pub async fn use_plugin<P>(&mut self, plugin: P) -> Result<()>
-    where
-        P: Plugin + 'static,
-    {
-        let plugin = Arc::new(plugin);
-        for dep in plugin.dependencies() {
-            if !self
-                .plugin_manager
-                .plugin_names()
-                .iter()
-                .any(|name| *name == dep)
-            {
-                return Err(Error::Other(format!(
-                    "plugin '{}' missing dependency '{}'",
-                    plugin.name(),
-                    dep
-                )));
-            }
-        }
-        plugin.on_browser_ready(self.browser_context).await?;
-        self.plugin_manager.register_arc(plugin);
-        self.plugin_manager.resolve_dependencies_and_order()?;
-        Ok(())
-    }
-
-    /// Return ordered plugin names currently registered in the browser.
-    pub fn plugin_names(&self) -> Vec<&'static str> {
-        self.plugin_manager.plugin_names()
-    }
-
-    /// Create a new page (tab) and navigate to the given URL.
-    pub async fn new_page(&self, url: impl Into<String>) -> Result<Page> {
-        let url = url.into();
-        // Create a blank page first so that plugin hooks (e.g. init scripts)
-        // are registered *before* navigating to the target URL.
-        let page = self.inner.new_page("about:blank").await?;
-
-        let page = Page::new(page)
-            .with_plugin_hooks(Arc::new(self.plugin_manager.clone()), self.browser_context);
-
-        if self.request_intercept_enabled {
-            page.start_request_interceptor().await?;
-        }
-
-        self.plugin_manager
-            .on_page_created(
-                &page,
-                PageCreatedContext {
-                    browser_context: self.browser_context,
-                },
+    /// Create a new isolated browser context.
+    pub async fn create_browser_context(&self) -> Result<BrowserContext> {
+        let resp = self
+            .target_manager
+            .transport()
+            .send_command(
+                crate::cdp::browser_protocol::target::CreateBrowserContextParams::default(),
+                None,
             )
             .await?;
 
-        self.plugin_manager
-            .on_target_created(TargetCreatedContext {
-                browser_context: self.browser_context,
-                url: url.clone(),
-            })
-            .await?;
-
-        // Now navigate — init scripts registered by plugins will execute
-        // before page scripts run.
-        page.goto(&url).await?;
-
-        Ok(page)
+        Ok(BrowserContext::new(
+            resp.browser_context_id,
+            self.target_manager.clone(),
+            Some(Arc::new(self.plugin_manager.clone())),
+            self.target_manager.transport().clone(),
+        ))
     }
 
-    /// Return all open pages.
-    pub async fn pages(&self) -> Result<Vec<Page>> {
-        let pages = self.inner.pages().await?;
-        Ok(pages
-            .into_iter()
-            .map(Page::new)
-            .map(|p| {
-                p.with_plugin_hooks(Arc::new(self.plugin_manager.clone()), self.browser_context)
-            })
-            .collect())
-    }
-
-    /// The browser user-agent string.
-    pub async fn user_agent(&self) -> Result<String> {
-        Ok(self.inner.user_agent().await?)
-    }
-
-    /// The WebSocket address of this browser.
     pub fn websocket_address(&self) -> &str {
-        self.inner.websocket_address()
+        &self.debug_ws_url
     }
 
-    /// Whether the browser is in incognito mode.
-    pub fn is_incognito(&self) -> bool {
-        self.inner.is_incognito()
+    /// Close the browser gracefully and clean up all resources.
+    pub async fn close(mut self) {
+        let transport = self.target_manager.transport();
+
+        // Try graceful CDP close, ignore errors
+        let _ = transport.send_command(CloseParams::default(), None).await;
+        transport.shutdown();
+
+        if let Some(h) = self.transport_handle.take() {
+            let _ = h.await;
+        }
+
+        if let Some(mut process) = self.process.take() {
+            process.shutdown().await;
+        }
     }
 
-    /// Get all cookies from the browser.
     pub async fn get_cookies(&self) -> Result<Vec<Cookie>> {
-        let cookies = self.inner.get_cookies().await?;
-        Ok(cookies.into_iter().map(Cookie::from).collect())
+        let resp = self
+            .target_manager
+            .transport()
+            .send_command(NetworkGetCookiesParams::default(), None)
+            .await?;
+        Ok(resp.cookies.into_iter().map(Cookie::from).collect())
     }
 
-    /// Set cookies.
     pub async fn set_cookies(&self, cookies: Vec<SetCookieParams>) -> Result<()> {
         let params: Vec<_> = cookies.into_iter().map(Into::into).collect();
-        self.inner.set_cookies(params).await?;
+        self.target_manager
+            .transport()
+            .send_command(NetworkSetCookiesParams::new(params), None)
+            .await?;
         Ok(())
     }
 
-    /// Clear all cookies.
     pub async fn clear_cookies(&self) -> Result<()> {
-        self.inner.clear_cookies().await?;
+        self.target_manager
+            .transport()
+            .send_command(ClearCookiesParams::default(), None)
+            .await?;
         Ok(())
     }
 
-    /// Request the browser to close.
-    pub async fn close(&mut self) -> Result<()> {
-        self.inner.close().await?;
-        self.inner.wait().await.map_err(Error::Io)?;
-        if let Some(h) = self.handler_handle.take() {
-            let _ = h.await;
-        }
-        Ok(())
+    pub async fn user_agent(&self) -> Result<String> {
+        let resp = self
+            .target_manager
+            .transport()
+            .send_command(GetVersionParams::default(), None)
+            .await?;
+        Ok(resp.user_agent)
     }
 
-    /// Forcibly kill the browser process.
-    pub async fn kill(&mut self) -> Result<()> {
-        self.inner.kill().await;
-        if let Some(h) = self.handler_handle.take() {
-            let _ = h.await;
-        }
-        Ok(())
+    /// Return the browser version string (e.g. "Chrome/120.0.6099.109").
+    pub async fn version(&self) -> Result<String> {
+        let resp = self
+            .target_manager
+            .transport()
+            .send_command(GetVersionParams::default(), None)
+            .await?;
+        Ok(resp.product)
+    }
+
+    /// Return all current page targets as `Page` objects.
+    pub async fn pages(&self) -> Result<Vec<Page>> {
+        let targets = self.target_manager.page_targets().await?;
+        Ok(targets.into_iter().map(Page::new).collect())
     }
 }
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        // The inner chromiumoxide Browser handles killing, so no extra logic needed.
+        self.target_manager.transport().shutdown();
+        // BrowserProcess::Drop handles child kill + temp dir cleanup
     }
 }
 
-fn build_chromium_config(options: &LaunchOptions) -> Result<chromiumoxide::BrowserConfig> {
-    let mut builder = chromiumoxide::BrowserConfig::builder();
+// ── Helpers ─────────────────────────────────────────────────────────
 
-    if let Some(path) = &options.executable {
-        builder = builder.chrome_executable(path);
+async fn read_ws_url_from_stderr(
+    mut reader: BufReader<tokio::process::ChildStderr>,
+) -> Result<String> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| Error::Launch(e.to_string()))?
+            == 0
+        {
+            return Err(Error::Launch("stderr closed prematurely".into()));
+        }
+        if let Some(pos) = line.find("listening on ") {
+            let ws = line[pos + 13..].trim();
+            if ws.starts_with("ws://") {
+                return Ok(ws.to_string());
+            }
+        }
     }
-
-    builder = match options.headless {
-        HeadlessMode::False => builder.with_head(),
-        HeadlessMode::True => builder,
-        HeadlessMode::New => builder.new_headless_mode(),
-    };
-
-    if let Some((width, height)) = options.window_size {
-        builder = builder.window_size(width, height);
-    }
-
-    if options.no_sandbox {
-        builder = builder.no_sandbox();
-    }
-
-    if options.incognito {
-        builder = builder.incognito();
-    }
-
-    if let Some(port) = options.port {
-        builder = builder.port(port);
-    }
-
-    if let Some(timeout) = options.launch_timeout {
-        builder = builder.launch_timeout(timeout);
-    }
-
-    if options.request_intercept {
-        builder = builder.enable_request_intercept();
-    }
-
-    for arg in &options.args {
-        builder = builder.arg(arg.clone());
-    }
-
-    builder.build().map_err(|e| Error::Launch(e.to_string()))
 }

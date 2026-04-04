@@ -13,7 +13,11 @@
 
 use std::time::Duration;
 
-use puprs::{Browser, BrowserConfigBuilder, HeadlessMode, StealthPlugin};
+use puprs::{BrowserLauncher, HeadlessMode};
+use puprs::element::Element;
+use puprs::page::Page;
+use puprs::plugins::StealthPlugin;
+use puprs::types::Point;
 use rand::Rng;
 
 const SERVER_URL: &str = "http://127.0.0.1:3000";
@@ -91,7 +95,7 @@ fn parse_args() -> Args {
 
 /// Simulate human-like mouse movement from (x1,y1) to (x2,y2) with random
 /// intermediate points and small delays.
-async fn human_mouse_move(page: &puprs::Page, from: (f64, f64), to: (f64, f64)) {
+async fn human_mouse_move(page: &Page, from: (f64, f64), to: (f64, f64)) {
     let mut rng = rand::rng();
     let steps = rng.random_range(8..15);
 
@@ -102,13 +106,13 @@ async fn human_mouse_move(page: &puprs::Page, from: (f64, f64), to: (f64, f64)) 
         let x = from.0 + (to.0 - from.0) * t + rng.random_range(-3.0..3.0);
         let y = from.1 + (to.1 - from.1) * t + rng.random_range(-3.0..3.0);
 
-        let _ = page.move_mouse(puprs::Point { x, y }).await;
+        let _ = page.move_mouse(Point { x, y }).await;
         tokio::time::sleep(Duration::from_millis(rng.random_range(10..40))).await;
     }
 }
 
 /// Simulate human-like typing with random delays between keystrokes.
-async fn human_type(element: &puprs::Element, text: &str) {
+async fn human_type(element: &Element, text: &str) {
     let mut rng = rand::rng();
     for ch in text.chars() {
         element.type_str(&ch.to_string()).await.ok();
@@ -132,7 +136,7 @@ async fn human_pause_short() {
 }
 
 #[tokio::main]
-async fn main() -> puprs::Result<()> {
+async fn main() -> puprs::error::Result<()> {
     let args = parse_args();
     println!("🤖 Login Bot starting...");
     println!("   Target: {}/login", args.server_url);
@@ -140,17 +144,14 @@ async fn main() -> puprs::Result<()> {
     println!();
 
     // Launch browser with stealth plugin
-    let config = BrowserConfigBuilder::new()
+    let browser = BrowserLauncher::new()
         .no_sandbox()
         .headless(args.headless)
-        .window_size(1280, 800)
-        .plugin(StealthPlugin::default())
-        .build()?;
-
-    let mut browser = Browser::launch(config).await?;
-    let page = browser
-        .new_page(format!("{}/login", args.server_url))
+        .plugin(StealthPlugin::new())
+        .launch()
         .await?;
+    let page = browser.new_page().await?;
+    page.goto(format!("{}/login", args.server_url)).await?;
 
     println!("[1/8] Page loaded, waiting for form...");
 
@@ -250,10 +251,10 @@ async fn main() -> puprs::Result<()> {
             }))
             .send()
             .await
-            .map_err(|e| puprs::Error::Other(format!("recognize request failed: {}", e)))?
+            .map_err(|e| puprs::error::Error::Other(format!("recognize request failed: {}", e)))?
             .json::<serde_json::Value>()
             .await
-            .map_err(|e| puprs::Error::Other(format!("recognize parse failed: {}", e)))?;
+            .map_err(|e| puprs::error::Error::Other(format!("recognize parse failed: {}", e)))?;
 
         #[derive(serde::Deserialize)]
         struct RecognizedTarget {
@@ -325,7 +326,7 @@ async fn main() -> puprs::Result<()> {
 
             human_mouse_move(&page, last_pos, (page_x, page_y)).await;
             human_pause_short().await;
-            page.click(puprs::Point {
+            page.click(Point {
                 x: page_x,
                 y: page_y,
             })
@@ -443,6 +444,6 @@ async fn main() -> puprs::Result<()> {
         }
     }
 
-    browser.close().await?;
+    browser.close().await;
     Ok(())
 }

@@ -562,7 +562,7 @@ async fn captcha_verify(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<CaptchaVerifyRequest>,
 ) -> impl IntoResponse {
-    // 1. Validate challenge exists
+    // - Validate challenge exists
     let challenge = {
         let mut challenges = state.captcha_challenges.lock().unwrap();
         challenges.remove(&body.challenge_id)
@@ -582,7 +582,7 @@ async fn captcha_verify(
         }
     };
 
-    // 2. Check challenge hasn't expired (2 min)
+    // - Check challenge hasn't expired (2 min)
     if now_ms() - challenge.created_at > 120_000 {
         println!("[🧩❌] Captcha verify: challenge expired");
         return (
@@ -594,7 +594,7 @@ async fn captcha_verify(
         );
     }
 
-    // 3. Validate clicks count matches
+    // - Validate clicks count matches
     if body.clicks.len() != challenge.targets.len() {
         println!("[🧩❌] Captcha verify: wrong number of clicks");
         return (
@@ -606,7 +606,7 @@ async fn captcha_verify(
         );
     }
 
-    // 4. Validate click positions match targets in order.
+    // - Validate click positions match targets in order.
     //    The client only sends (x, y) coordinates — it doesn't know target numbers.
     //    We check each click hits the correct next target within radius.
     for (i, (click, target)) in body.clicks.iter().zip(challenge.targets.iter()).enumerate() {
@@ -630,7 +630,7 @@ async fn captcha_verify(
         }
     }
 
-    // 5. Check click timing (should have variation, not instant)
+    // - Check click timing (should have variation, not instant)
     if body.clicks.len() >= 2 {
         let mut intervals: Vec<f64> = Vec::new();
         for i in 1..body.clicks.len() {
@@ -673,7 +673,7 @@ async fn captcha_verify(
         }
     }
 
-    // 6. Check mouse path exists
+    // - Check mouse path exists
     let mouse_path_len = body.mouse_path.as_ref().map_or(0, |p| p.len());
     if mouse_path_len < 5 {
         println!(
@@ -789,7 +789,7 @@ async fn login(
 ) -> impl IntoResponse {
     let mut server_detections: Vec<String> = Vec::new();
 
-    // 1. CSRF token validation
+    // - CSRF token validation
     let csrf_valid = if let Some(token) = &body.csrf_token {
         let mut tokens = state.csrf_tokens.lock().unwrap();
         tokens.remove(token).is_some()
@@ -800,14 +800,14 @@ async fn login(
         server_detections.push("csrf_invalid: missing or expired CSRF token".into());
     }
 
-    // 2. Honeypot check
+    // - Honeypot check
     if let Some(email) = &body.email {
         if !email.is_empty() {
             server_detections.push(format!("honeypot_filled: email=\"{}\"", email));
         }
     }
 
-    // 3. Rate limiting (max 5 attempts per 60s)
+    // - Rate limiting (max 5 attempts per 60s)
     {
         let mut attempts = state.login_attempts.lock().unwrap();
         let entry = attempts.entry("global".into()).or_default();
@@ -822,7 +822,7 @@ async fn login(
         entry.push(now_ms());
     }
 
-    // 4. Captcha token validation
+    // - Captcha token validation
     let captcha_valid = if let Some(token) = &body.captcha_token {
         let mut tokens = state.captcha_tokens.lock().unwrap();
         tokens.remove(token).is_some()

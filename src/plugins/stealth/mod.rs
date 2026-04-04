@@ -2,9 +2,10 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 
+use crate::browser::LaunchOptions;
 use crate::error::Result;
 use crate::page::Page;
-use crate::plugin::{LaunchOptions, PageCreatedContext, Plugin, PluginRequirement};
+use crate::plugin::{PageCreatedContext, Plugin};
 
 // ── Embedded JS evasion scripts ─────────────────────────────────────────
 const UTILS_JS: &str = include_str!("utils.js");
@@ -146,46 +147,49 @@ impl Plugin for StealthPlugin {
         "stealth"
     }
 
-    fn requirements(&self) -> Vec<PluginRequirement> {
-        vec![PluginRequirement::RunLast]
-    }
-
     async fn before_launch(&self, options: &mut LaunchOptions) -> Result<()> {
         if !self.add_automation_controlled_flag {
             return Ok(());
         }
 
         let mut found = false;
-        for arg in &mut options.args {
-            if arg.starts_with("--disable-blink-features=") {
-                if !arg.contains("AutomationControlled") {
-                    arg.push_str(",AutomationControlled");
+        for (k, v) in &mut options.args {
+            if k == "--disable-blink-features" {
+                if let Some(val) = v {
+                    if !val.contains("AutomationControlled") {
+                        val.push_str(",AutomationControlled");
+                    }
+                } else {
+                    *v = Some("AutomationControlled".to_string());
                 }
                 found = true;
                 break;
             }
         }
         if !found {
-            options
-                .args
-                .push("--disable-blink-features=AutomationControlled".to_string());
+            options.args.push(("--disable-blink-features".to_string(), Some("AutomationControlled".to_string())));
         }
         Ok(())
     }
 
     async fn on_page_created(&self, page: &Page, _ctx: PageCreatedContext) -> Result<()> {
-        if let Some(ua) = &self.user_agent {
-            page.enable_stealth_mode_with_agent(ua).await?;
-        } else {
-            page.enable_stealth_mode().await?;
-        }
+        let ua = self.user_agent.as_deref().unwrap_or(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        );
+        page.set_user_agent(ua).await?;
 
         // Inject utils first — all evasion scripts depend on it.
-        page.add_init_script(UTILS_JS).await?;
+        // Use isolated world so page scripts cannot detect or override them.
+        page.evaluate_on_new_document_in_world(UTILS_JS, "__puprs_utility_world__")
+            .await?;
 
-        // Inject enabled evasion scripts.
+        // Inject enabled evasion scripts in isolated world.
         for evasion in &self.enabled_evasions {
-            page.add_init_script(evasion.init_script()).await?;
+            page.evaluate_on_new_document_in_world(
+                evasion.init_script(),
+                "__puprs_utility_world__",
+            )
+            .await?;
         }
 
         Ok(())
