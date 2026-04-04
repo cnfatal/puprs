@@ -190,18 +190,13 @@ impl LifecycleWatcher {
             "Network.responseReceived" => {
                 if self.request_matches_navigation(event) {
                     self.navigation_response = Some(NavigationResponse {
-                        request_id: self
-                            .navigation_request_id
-                            .clone()
-                            .unwrap_or_default(),
+                        request_id: self.navigation_request_id.clone().unwrap_or_default(),
                         url: event
                             .params
                             .get("response")
                             .and_then(|v| v.get("url"))
                             .and_then(|v| v.as_str())
-                            .or_else(|| {
-                                event.params.get("documentURL").and_then(|v| v.as_str())
-                            })
+                            .or_else(|| event.params.get("documentURL").and_then(|v| v.as_str()))
                             .unwrap_or_default()
                             .to_owned(),
                         status: event

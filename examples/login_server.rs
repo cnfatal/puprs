@@ -342,7 +342,7 @@ fn draw_digit(img: &mut image::RgbaImage, cx: i32, cy: i32, digit: u32, color: i
         ],
     ];
 
-    if digit < 1 || digit > 5 {
+    if !(1..=5).contains(&digit) {
         return;
     }
     let glyph = glyphs[(digit - 1) as usize];
@@ -386,7 +386,7 @@ async fn captcha_init(
         if fp.plugins_count.unwrap_or(0) == 0 {
             fp_flags.push("no_plugins");
         }
-        if fp.languages.as_ref().map_or(true, |l| l.is_empty()) {
+        if fp.languages.as_ref().is_none_or(|l| l.is_empty()) {
             fp_flags.push("no_languages");
         }
         if let Some(ref ua) = fp.user_agent {

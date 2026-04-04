@@ -3,9 +3,7 @@ use crate::cdp::browser_protocol::dom::{
     QuerySelectorAllParams, QuerySelectorParams, ResolveNodeParams, SetFileInputFilesParams,
 };
 use crate::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use crate::cdp::js_protocol::runtime::{
-    CallArgument, CallFunctionOnParams, RemoteObjectId,
-};
+use crate::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams, RemoteObjectId};
 
 use crate::error::{Error, Result};
 use crate::page::Page;
@@ -171,8 +169,7 @@ impl Element {
     ///
     /// Returns the list of values that were actually selected.
     pub async fn select(&self, values: &[&str]) -> Result<Vec<String>> {
-        let values_json = serde_json::to_string(values)
-            .map_err(|e| Error::Other(e.to_string()))?;
+        let values_json = serde_json::to_string(values).map_err(|e| Error::Other(e.to_string()))?;
 
         let js = format!(
             r#"function() {{
@@ -199,9 +196,10 @@ impl Element {
 
         let result = self.call_js_fn(&js, false).await?;
         match result.value() {
-            Some(serde_json::Value::Array(arr)) => {
-                Ok(arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            }
+            Some(serde_json::Value::Array(arr)) => Ok(arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()),
             _ => Ok(vec![]),
         }
     }
@@ -213,7 +211,7 @@ impl Element {
             .files(files)
             .backend_node_id(self.backend_node_id)
             .build()
-            .map_err(|e| Error::Other(e))?;
+            .map_err(Error::Other)?;
         self.page.execute(params).await?;
         Ok(())
     }
@@ -347,18 +345,15 @@ impl Element {
             )
             .await?;
 
-        fn to_quad(cdp_quad: &crate::cdp::browser_protocol::dom::Quad) -> std::result::Result<Quad, Error> {
+        fn to_quad(
+            cdp_quad: &crate::cdp::browser_protocol::dom::Quad,
+        ) -> std::result::Result<Quad, Error> {
             let v = cdp_quad.inner();
             if v.len() < 8 {
                 return Err(Error::Other("invalid box model quad".into()));
             }
             Ok(Quad {
-                points: [
-                    (v[0], v[1]),
-                    (v[2], v[3]),
-                    (v[4], v[5]),
-                    (v[6], v[7]),
-                ],
+                points: [(v[0], v[1]), (v[2], v[3]), (v[4], v[5]), (v[6], v[7])],
             })
         }
 

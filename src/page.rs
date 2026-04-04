@@ -719,13 +719,13 @@ impl Page {
         let resp = self.execute(params).await?;
 
         if let Some(exception) = resp.exception_details {
-            return Err(Error::JavaScript(format!(
-                "{}",
+            return Err(Error::JavaScript(
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text)
-            )));
+                    .unwrap_or(exception.text)
+                    .to_string(),
+            ));
         }
 
         let object_id = resp.result.object_id.ok_or_else(|| {
@@ -774,13 +774,13 @@ impl Page {
         let resp = self.execute(params).await?;
 
         if let Some(exception) = resp.exception_details {
-            return Err(Error::JavaScript(format!(
-                "{}",
+            return Err(Error::JavaScript(
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text)
-            )));
+                    .unwrap_or(exception.text)
+                    .to_string(),
+            ));
         }
 
         let arr_object_id = match resp.result.object_id {
@@ -925,13 +925,13 @@ impl Page {
         let resp = self.execute(params).await?;
 
         if let Some(exception) = resp.exception_details {
-            return Err(Error::JavaScript(format!(
-                "{}",
+            return Err(Error::JavaScript(
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text)
-            )));
+                    .unwrap_or(exception.text)
+                    .to_string(),
+            ));
         }
 
         // If result is a function, try again as callFunctionOn
@@ -972,13 +972,13 @@ impl Page {
         let resp = self.execute(params).await?;
 
         if let Some(exception) = resp.exception_details {
-            return Err(Error::JavaScript(format!(
-                "{}",
+            return Err(Error::JavaScript(
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text)
-            )));
+                    .unwrap_or(exception.text)
+                    .to_string(),
+            ));
         }
 
         if let Some(object_id) = resp.result.object_id {
@@ -1009,13 +1009,13 @@ impl Page {
         let resp = self.execute(params).await?;
 
         if let Some(exception) = resp.exception_details {
-            return Err(Error::JavaScript(format!(
-                "{}",
+            return Err(Error::JavaScript(
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text)
-            )));
+                    .unwrap_or(exception.text)
+                    .to_string(),
+            ));
         }
 
         Ok(EvaluationResult::from_remote_object(resp.result))
@@ -1039,7 +1039,7 @@ impl Page {
                 .source(script.into())
                 .world_name(world_name.into())
                 .build()
-                .map_err(|e| Error::Other(e))?,
+                .map_err(Error::Other)?,
         )
         .await?;
         Ok(())
@@ -1470,7 +1470,7 @@ impl Page {
     /// Retrieve layout metrics of the page.
     pub async fn layout_metrics(&self) -> Result<GetLayoutMetricsReturns> {
         use crate::cdp::browser_protocol::page::GetLayoutMetricsParams;
-        Ok(self.execute(GetLayoutMetricsParams::default()).await?)
+        self.execute(GetLayoutMetricsParams::default()).await
     }
 
     // ── DOM access ──────────────────────────────────────────────────
@@ -2053,8 +2053,8 @@ fn expose_function_init_script(name: &str, binding_name: &str) -> String {
 /// Heuristic: detect if a JS string is likely a function.
 pub(crate) fn is_likely_js_function(s: &str) -> bool {
     let trimmed = s.trim();
-    if trimmed.starts_with("async ") {
-        let rest = trimmed["async ".len()..].trim_start();
+    if let Some(stripped) = trimmed.strip_prefix("async ") {
+        let rest = stripped.trim_start();
         if rest.starts_with("function") {
             return true;
         }

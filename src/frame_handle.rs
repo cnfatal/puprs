@@ -93,13 +93,13 @@ impl FrameHandle {
 
         let resp = self.page.execute(params).await?;
         if let Some(exception) = resp.exception_details {
-            return Err(Error::JavaScript(format!(
-                "{}",
+            return Err(Error::JavaScript(
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text)
-            )));
+                    .unwrap_or(exception.text)
+                    .to_string(),
+            ));
         }
 
         if resp.result.r#type == RemoteObjectType::Function {
@@ -145,7 +145,7 @@ impl FrameHandle {
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text),
+                    .unwrap_or(exception.text),
             ));
         }
 
@@ -198,7 +198,7 @@ impl FrameHandle {
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text),
+                    .unwrap_or(exception.text),
             ));
         }
 

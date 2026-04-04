@@ -96,7 +96,7 @@ impl BrowserProcess {
 
 impl Drop for BrowserProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        std::mem::drop(self.child.kill());
         if let Some(ref path) = self.temp_user_data_dir {
             let _ = std::fs::remove_dir_all(path);
         }
@@ -275,7 +275,8 @@ impl BrowserLauncher {
 
         // Connect transport
         let (transport, transport_handle) = Transport::connect(&ws_url).await?;
-        let target_manager = TargetManager::create(transport, Some(Arc::new(plugin_manager.clone()))).await?;
+        let target_manager =
+            TargetManager::create(transport, Some(Arc::new(plugin_manager.clone()))).await?;
 
         plugin_manager.on_browser_ready().await?;
 
@@ -326,7 +327,8 @@ impl BrowserConnector {
         plugin_manager.before_connect(&mut self.options).await?;
 
         let (transport, transport_handle) = Transport::connect(&self.options.websocket_url).await?;
-        let target_manager = TargetManager::create(transport, Some(Arc::new(plugin_manager.clone()))).await?;
+        let target_manager =
+            TargetManager::create(transport, Some(Arc::new(plugin_manager.clone()))).await?;
 
         plugin_manager.on_browser_ready().await?;
 
@@ -365,7 +367,11 @@ impl Browser {
     }
 
     pub async fn new_page(&self) -> Result<Page> {
-        Page::create(&self.target_manager, Some(Arc::new(self.plugin_manager.clone()))).await
+        Page::create(
+            &self.target_manager,
+            Some(Arc::new(self.plugin_manager.clone())),
+        )
+        .await
     }
 
     /// Create a new isolated browser context.

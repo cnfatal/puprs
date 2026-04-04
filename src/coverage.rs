@@ -53,9 +53,7 @@ impl Coverage {
     /// Enables the Profiler domain and begins precise coverage collection
     /// with call counts and detailed (block-level) granularity.
     pub async fn start_js_coverage(&self) -> Result<()> {
-        self.target
-            .execute(ProfilerEnableParams::default())
-            .await?;
+        self.target.execute(ProfilerEnableParams::default()).await?;
         self.target
             .execute(StartPreciseCoverageParams {
                 call_count: Some(true),

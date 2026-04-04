@@ -6,20 +6,15 @@ use crate::injected::INJECTED_SOURCE;
 use crate::page::Page;
 
 /// Polling strategy for [`WaitForFunctionOptions`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum PollingStrategy {
     /// Re-evaluate on every DOM mutation.
     Mutation,
     /// Re-evaluate on every `requestAnimationFrame` callback.
+    #[default]
     Raf,
     /// Re-evaluate on a fixed interval.
     Interval(Duration),
-}
-
-impl Default for PollingStrategy {
-    fn default() -> Self {
-        Self::Raf
-    }
 }
 
 /// Options for `Page::wait_for_selector`.

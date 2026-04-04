@@ -165,7 +165,7 @@ impl FrameManager {
                     .source(format!("//# sourceURL={world_name}"))
                     .world_name(world_name)
                     .build()
-                    .map_err(|e| Error::Other(e))?,
+                    .map_err(Error::Other)?,
             )
             .await?;
 

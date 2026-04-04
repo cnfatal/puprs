@@ -6,12 +6,11 @@
 //! [`Page::mouse()`](crate::page::Page::mouse), or
 //! [`Page::touchscreen()`](crate::page::Page::touchscreen).
 
-use crate::cdp::browser_protocol::input::{
-    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
-    DispatchMouseEventType, DispatchTouchEventParams, DispatchTouchEventType, MouseButton,
-    TouchPoint,
-};
 use crate::cdp::Command;
+use crate::cdp::browser_protocol::input::{
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    DispatchTouchEventParams, DispatchTouchEventType, MouseButton, TouchPoint,
+};
 use crate::error::{Error, Result};
 use crate::target::Target;
 use crate::types::Point;

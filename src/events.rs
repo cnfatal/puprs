@@ -108,11 +108,10 @@ pub(crate) fn convert_cdp_to_page_event(event: &CdpEvent) -> Option<PageEvent> {
             let text = args
                 .iter()
                 .filter_map(|a| {
-                    a.get("value")
-                        .and_then(|v| match v {
-                            serde_json::Value::String(s) => Some(s.clone()),
-                            other => Some(other.to_string()),
-                        })
+                    a.get("value").map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
                 })
                 .collect::<Vec<_>>()
                 .join(" ");

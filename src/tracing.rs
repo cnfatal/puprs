@@ -6,9 +6,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::cdp::browser_protocol::io::{
-    CloseParams as IoCloseParams, ReadParams as IoReadParams,
-};
+use crate::cdp::browser_protocol::io::{CloseParams as IoCloseParams, ReadParams as IoReadParams};
 use crate::cdp::browser_protocol::tracing::{
     EndParams as TracingEndParams, EventTracingComplete, StartParams as TracingStartParams,
     StartTransferMode, TraceConfig,
@@ -127,10 +125,7 @@ impl Tracing {
         }
 
         // Close the stream.
-        let _ = self
-            .target
-            .execute(IoCloseParams::new(stream_handle))
-            .await;
+        let _ = self.target.execute(IoCloseParams::new(stream_handle)).await;
 
         // Optionally write to file.
         let path = self.path.lock().await.take();

@@ -34,15 +34,14 @@ pub fn default_executable(options: DetectionOptions) -> Result<PathBuf, String> 
         return Ok(path);
     }
 
-    Err(format!(
-        "Could not auto-detect a Chrome/Chromium executable.\n\
+    Err("Could not auto-detect a Chrome/Chromium executable.\n\
          Searched:\n\
          - $CHROME env var\n\
          - PATH (chrome, chromium, msedge, …)\n\
          - Windows registry (App Paths\\chrome.exe)\n\
          - Common install directories\n\
          Hint: set the CHROME environment variable or use .executable() in BrowserConfigBuilder."
-    ))
+        .to_string())
 }
 
 fn get_by_env_var() -> Option<PathBuf> {

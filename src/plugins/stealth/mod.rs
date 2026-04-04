@@ -167,7 +167,10 @@ impl Plugin for StealthPlugin {
             }
         }
         if !found {
-            options.args.push(("--disable-blink-features".to_string(), Some("AutomationControlled".to_string())));
+            options.args.push((
+                "--disable-blink-features".to_string(),
+                Some("AutomationControlled".to_string()),
+            ));
         }
         Ok(())
     }

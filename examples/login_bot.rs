@@ -13,11 +13,11 @@
 
 use std::time::Duration;
 
-use puprs::{BrowserLauncher, HeadlessMode};
 use puprs::element::Element;
 use puprs::page::Page;
 use puprs::plugins::StealthPlugin;
 use puprs::types::Point;
+use puprs::{BrowserLauncher, HeadlessMode};
 use rand::Rng;
 
 const SERVER_URL: &str = "http://127.0.0.1:3000";

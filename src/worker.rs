@@ -56,13 +56,13 @@ impl WebWorker {
         let resp = self.target.execute(params).await?;
 
         if let Some(exception) = resp.exception_details {
-            return Err(Error::JavaScript(format!(
-                "{}",
+            return Err(Error::JavaScript(
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text)
-            )));
+                    .unwrap_or(exception.text)
+                    .to_string(),
+            ));
         }
 
         Ok(EvaluationResult::from_remote_object(resp.result))

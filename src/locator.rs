@@ -231,7 +231,7 @@ impl NodeLocator {
     /// Wait for the element and return its serialized JSON value.
     pub async fn wait(&self) -> Result<serde_json::Value> {
         let el = self.wait_handle().await?;
-        Ok(el.json_value().await?)
+        el.json_value().await
     }
 
     /// Click the located element.
@@ -355,9 +355,9 @@ impl NodeLocator {
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(Error::Timeout(format!(
-                        "filter predicate timed out for locator"
-                    )));
+                    return Err(Error::Timeout(
+                        "filter predicate timed out for locator".to_string(),
+                    ));
                 }
                 tokio::time::sleep(RETRY_DELAY).await;
             }

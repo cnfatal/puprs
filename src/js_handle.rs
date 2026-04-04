@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::cdp::js_protocol::runtime::{
-    CallFunctionOnParams, ReleaseObjectParams, RemoteObjectId,
-};
+use crate::cdp::js_protocol::runtime::{CallFunctionOnParams, ReleaseObjectParams, RemoteObjectId};
 use crate::error::{Error, Result};
 use crate::page::Page;
 use crate::types::EvaluationResult;
@@ -82,7 +80,7 @@ impl JSHandle {
                 exception
                     .exception
                     .and_then(|e| e.description)
-                    .unwrap_or_else(|| exception.text),
+                    .unwrap_or(exception.text),
             ));
         }
 

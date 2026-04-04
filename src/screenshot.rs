@@ -43,35 +43,30 @@ impl ClipRect {
     }
 }
 
-impl From<ScreenshotOptions>
-    for crate::cdp::browser_protocol::page::CaptureScreenshotParams
-{
+impl From<ScreenshotOptions> for crate::cdp::browser_protocol::page::CaptureScreenshotParams {
     fn from(o: ScreenshotOptions) -> Self {
         use crate::cdp::browser_protocol::page::{
             CaptureScreenshotFormat, CaptureScreenshotParams, Viewport,
         };
 
-        let mut params = CaptureScreenshotParams::default();
-        params.format = Some(match o.format {
-            ImageFormat::Png => CaptureScreenshotFormat::Png,
-            ImageFormat::Jpeg => CaptureScreenshotFormat::Jpeg,
-            ImageFormat::Webp => CaptureScreenshotFormat::Webp,
-        });
-        params.quality = o.quality;
-        params.capture_beyond_viewport = o.capture_beyond_viewport;
-        params.from_surface = o.from_surface;
-
-        if let Some(clip) = o.clip {
-            params.clip = Some(Viewport {
+        CaptureScreenshotParams {
+            format: Some(match o.format {
+                ImageFormat::Png => CaptureScreenshotFormat::Png,
+                ImageFormat::Jpeg => CaptureScreenshotFormat::Jpeg,
+                ImageFormat::Webp => CaptureScreenshotFormat::Webp,
+            }),
+            quality: o.quality,
+            clip: o.clip.map(|clip| Viewport {
                 x: clip.x,
                 y: clip.y,
                 width: clip.width,
                 height: clip.height,
                 scale: clip.scale,
-            });
+            }),
+            capture_beyond_viewport: o.capture_beyond_viewport,
+            from_surface: o.from_surface,
+            ..Default::default()
         }
-
-        params
     }
 }
 
@@ -96,21 +91,22 @@ pub struct PdfOptions {
 
 impl From<PdfOptions> for crate::cdp::browser_protocol::page::PrintToPdfParams {
     fn from(o: PdfOptions) -> Self {
-        let mut p = crate::cdp::browser_protocol::page::PrintToPdfParams::default();
-        p.landscape = o.landscape;
-        p.display_header_footer = o.display_header_footer;
-        p.print_background = o.print_background;
-        p.scale = o.scale;
-        p.paper_width = o.paper_width;
-        p.paper_height = o.paper_height;
-        p.margin_top = o.margin_top;
-        p.margin_bottom = o.margin_bottom;
-        p.margin_left = o.margin_left;
-        p.margin_right = o.margin_right;
-        p.page_ranges = o.page_ranges;
-        p.header_template = o.header_template;
-        p.footer_template = o.footer_template;
-        p.prefer_css_page_size = o.prefer_css_page_size;
-        p
+        crate::cdp::browser_protocol::page::PrintToPdfParams {
+            landscape: o.landscape,
+            display_header_footer: o.display_header_footer,
+            print_background: o.print_background,
+            scale: o.scale,
+            paper_width: o.paper_width,
+            paper_height: o.paper_height,
+            margin_top: o.margin_top,
+            margin_bottom: o.margin_bottom,
+            margin_left: o.margin_left,
+            margin_right: o.margin_right,
+            page_ranges: o.page_ranges,
+            header_template: o.header_template,
+            footer_template: o.footer_template,
+            prefer_css_page_size: o.prefer_css_page_size,
+            ..Default::default()
+        }
     }
 }

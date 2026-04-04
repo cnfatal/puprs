@@ -110,10 +110,7 @@ impl Accessibility {
 }
 
 /// Recursively build the tree from the flat map.
-fn build_tree(
-    node_id: &str,
-    nodes: &mut HashMap<String, (AXNode, Vec<String>)>,
-) -> Result<AXNode> {
+fn build_tree(node_id: &str, nodes: &mut HashMap<String, (AXNode, Vec<String>)>) -> Result<AXNode> {
     let (mut node, child_ids) = nodes.remove(node_id).unwrap_or_else(|| {
         (
             AXNode {

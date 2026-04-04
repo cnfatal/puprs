@@ -76,8 +76,7 @@ impl SetCookieParams {
 
 impl From<SetCookieParams> for crate::cdp::browser_protocol::network::CookieParam {
     fn from(p: SetCookieParams) -> Self {
-        let mut cp =
-            crate::cdp::browser_protocol::network::CookieParam::new(p.name, p.value);
+        let mut cp = crate::cdp::browser_protocol::network::CookieParam::new(p.name, p.value);
         cp.url = p.url;
         cp.domain = p.domain;
         cp.path = p.path;
@@ -85,7 +84,7 @@ impl From<SetCookieParams> for crate::cdp::browser_protocol::network::CookiePara
         cp.http_only = p.http_only;
         cp.expires = p
             .expires
-            .map(|e| crate::cdp::browser_protocol::network::TimeSinceEpoch::new(e));
+            .map(crate::cdp::browser_protocol::network::TimeSinceEpoch::new);
         cp
     }
 }
@@ -110,12 +109,9 @@ impl DeleteCookieParams {
     }
 }
 
-impl From<DeleteCookieParams>
-    for crate::cdp::browser_protocol::network::DeleteCookiesParams
-{
+impl From<DeleteCookieParams> for crate::cdp::browser_protocol::network::DeleteCookiesParams {
     fn from(p: DeleteCookieParams) -> Self {
-        let mut dp =
-            crate::cdp::browser_protocol::network::DeleteCookiesParams::new(p.name);
+        let mut dp = crate::cdp::browser_protocol::network::DeleteCookiesParams::new(p.name);
         dp.url = p.url;
         dp.domain = p.domain;
         dp.path = p.path;

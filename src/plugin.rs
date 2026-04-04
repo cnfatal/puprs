@@ -28,17 +28,12 @@ pub struct InterceptedRequest {
 }
 
 /// Decision returned by request interception hooks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RequestDecision {
+    #[default]
     Continue,
     Abort,
     Fulfill(FulfillResponse),
-}
-
-impl Default for RequestDecision {
-    fn default() -> Self {
-        Self::Continue
-    }
 }
 
 /// Synthetic HTTP response payload for request fulfillment.
@@ -228,7 +223,7 @@ impl PluginManager {
         let names = self.plugin_names();
 
         for dep in plugin.dependencies() {
-            if !names.iter().any(|name| *name == dep) {
+            if !names.contains(&dep) {
                 return Err(crate::error::Error::Other(format!(
                     "plugin '{}' missing dependency '{}'",
                     plugin.name(),
