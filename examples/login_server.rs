@@ -1,10 +1,10 @@
-//! 登录防御服务器 — 启动带有 Bot 检测的 HTTP 登录服务。
+//! Login defense server — starts an HTTP login service with bot detection.
 //!
-//! 先启动此服务，再运行 `login_bot` 示例进行自动化登录。
+//! Start this server first, then run the `login_bot` example for automated login.
 //!
 //! ```sh
 //! cargo run --example login_server
-//! # 另一个终端:
+//! # In another terminal:
 //! cargo run --example login_bot
 //! ```
 

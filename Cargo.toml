@@ -9,6 +9,7 @@ repository = "https://github.com/cnfatal/puprs"
 homepage = "https://github.com/cnfatal/puprs"
 keywords = ["browser", "automation", "puppeteer", "chrome", "cdp"]
 categories = ["web-programming"]
+exclude = [".github/"]
 
 [dependencies]
 chromiumoxide_cdp = "0.9"
