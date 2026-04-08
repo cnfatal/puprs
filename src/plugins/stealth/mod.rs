@@ -109,7 +109,7 @@ impl Default for StealthPlugin {
 
         Self {
             user_agent: None,
-            add_automation_controlled_flag: true,
+            add_automation_controlled_flag: false,
             enabled_evasions,
         }
     }

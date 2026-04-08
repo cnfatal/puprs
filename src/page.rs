@@ -245,7 +245,8 @@ impl Page {
                 }
             };
 
-            let target = Target::new(self.target.transport.clone(), session_id, target_id_str);
+            let target =
+                Target::new_simple(self.target.transport.clone(), session_id, target_id_str);
             workers.push(WebWorker::new(info.url, worker_type, target));
         }
 

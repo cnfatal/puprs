@@ -18,9 +18,23 @@ use crate::error::{Error, Result};
 use crate::page::Page;
 use crate::plugin::{Plugin, PluginManager};
 use crate::query::QueryHandlerRegistry;
-use crate::target::TargetManager;
+use crate::target::{Target, TargetEvent, TargetManager, TargetType};
 use crate::transport::Transport;
 use crate::types::Viewport;
+use tokio::sync::broadcast;
+
+/// Browser-level events (aligned with Puppeteer `BrowserEvent`).
+#[derive(Debug, Clone)]
+pub enum BrowserEvent {
+    /// A target was created (page, worker, etc.)
+    TargetCreated(Target),
+    /// A target was destroyed.
+    TargetDestroyed(Target),
+    /// A target's URL changed.
+    TargetChanged(Target),
+    /// The browser was disconnected.
+    Disconnected,
+}
 
 /// Browser headless mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -303,6 +317,39 @@ impl BrowserLauncher {
 
         let query_handlers = QueryHandlerRegistry::with_builtins();
 
+        let (browser_event_tx, _) = broadcast::channel(64);
+        {
+            let mut target_rx = target_manager.target_event_receiver();
+            let btx = browser_event_tx.clone();
+            tokio::spawn(async move {
+                while let Ok(event) = target_rx.recv().await {
+                    let browser_event = match event {
+                        TargetEvent::TargetAvailable(t) => {
+                            if t.is_target_exposed().await {
+                                Some(BrowserEvent::TargetCreated(t))
+                            } else {
+                                None
+                            }
+                        }
+                        TargetEvent::TargetGone(t) => {
+                            if t.is_target_exposed().await {
+                                Some(BrowserEvent::TargetDestroyed(t))
+                            } else {
+                                None
+                            }
+                        }
+                        TargetEvent::TargetChanged { target, .. } => {
+                            Some(BrowserEvent::TargetChanged(target))
+                        }
+                        TargetEvent::TargetDiscovered(_) => None,
+                    };
+                    if let Some(e) = browser_event {
+                        let _ = btx.send(e);
+                    }
+                }
+            });
+        }
+
         Ok(Browser {
             inner: Arc::new(BrowserInner {
                 target_manager,
@@ -314,6 +361,7 @@ impl BrowserLauncher {
                 is_connected: false,
                 query_handlers,
                 default_viewport: self.default_viewport,
+                browser_event_tx,
             }),
         })
     }
@@ -363,6 +411,39 @@ impl BrowserConnector {
 
         let query_handlers = QueryHandlerRegistry::with_builtins();
 
+        let (browser_event_tx, _) = broadcast::channel(64);
+        {
+            let mut target_rx = target_manager.target_event_receiver();
+            let btx = browser_event_tx.clone();
+            tokio::spawn(async move {
+                while let Ok(event) = target_rx.recv().await {
+                    let browser_event = match event {
+                        TargetEvent::TargetAvailable(t) => {
+                            if t.is_target_exposed().await {
+                                Some(BrowserEvent::TargetCreated(t))
+                            } else {
+                                None
+                            }
+                        }
+                        TargetEvent::TargetGone(t) => {
+                            if t.is_target_exposed().await {
+                                Some(BrowserEvent::TargetDestroyed(t))
+                            } else {
+                                None
+                            }
+                        }
+                        TargetEvent::TargetChanged { target, .. } => {
+                            Some(BrowserEvent::TargetChanged(target))
+                        }
+                        TargetEvent::TargetDiscovered(_) => None,
+                    };
+                    if let Some(e) = browser_event {
+                        let _ = btx.send(e);
+                    }
+                }
+            });
+        }
+
         Ok(Browser {
             inner: Arc::new(BrowserInner {
                 target_manager,
@@ -374,6 +455,7 @@ impl BrowserConnector {
                 is_connected: true,
                 query_handlers,
                 default_viewport: None,
+                browser_event_tx,
             }),
         })
     }
@@ -396,6 +478,8 @@ pub(crate) struct BrowserInner {
     pub(crate) query_handlers: QueryHandlerRegistry,
     /// Default viewport for new pages. `None` = disabled.
     pub(crate) default_viewport: Option<Viewport>,
+    /// Browser-level event sender.
+    browser_event_tx: broadcast::Sender<BrowserEvent>,
 }
 
 /// A running browser instance. Clone is cheap (Arc handle).
@@ -491,6 +575,7 @@ impl Browser {
         }
 
         self.inner.disconnected.notify_waiters();
+        let _ = self.inner.browser_event_tx.send(BrowserEvent::Disconnected);
     }
 
     /// Disconnect the WebSocket connection without closing the browser process.
@@ -503,6 +588,7 @@ impl Browser {
         }
 
         self.inner.disconnected.notify_waiters();
+        let _ = self.inner.browser_event_tx.send(BrowserEvent::Disconnected);
     }
 
     /// Wait for the browser connection to close (user close, crash, disconnect, etc.).
@@ -584,6 +670,70 @@ impl Browser {
     /// Return all current page targets as `Page` objects (zero CDP calls).
     pub async fn pages(&self) -> Vec<Page> {
         self.inner.target_manager.pages().await
+    }
+
+    /// Subscribe to browser-level events.
+    pub fn event_receiver(&self) -> broadcast::Receiver<BrowserEvent> {
+        self.inner.browser_event_tx.subscribe()
+    }
+
+    /// Return all currently known targets (aligned with Puppeteer `browser.targets()`).
+    ///
+    /// Filters out internal targets (TAB type, targets with subtypes) and
+    /// only returns initialized targets.
+    pub async fn targets(&self) -> Vec<Target> {
+        self.inner.target_manager.exposed_targets().await
+    }
+
+    /// Get the browser's own target.
+    pub async fn target(&self) -> Option<Target> {
+        let all = self.inner.target_manager.exposed_targets().await;
+        for t in all {
+            if t.target_type().await == TargetType::Browser {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// Wait for a target matching the predicate.
+    ///
+    /// Checks existing targets first, then listens for new events.
+    pub async fn wait_for_target<F>(&self, predicate: F, timeout: Duration) -> Result<Target>
+    where
+        F: Fn(&Target) -> bool,
+    {
+        // Check existing targets
+        for t in self.targets().await {
+            if predicate(&t) {
+                return Ok(t);
+            }
+        }
+
+        // Listen for new events
+        let mut rx = self.event_receiver();
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Timeout("wait_for_target timed out".into()));
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(BrowserEvent::TargetCreated(t) | BrowserEvent::TargetChanged(t))) => {
+                    if predicate(&t) {
+                        return Ok(t);
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => {
+                    return Err(Error::Connection("event channel closed".into()));
+                }
+                Err(_) => {
+                    return Err(Error::Timeout("wait_for_target timed out".into()));
+                }
+            }
+        }
     }
 }
 

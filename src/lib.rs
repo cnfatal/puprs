@@ -54,7 +54,7 @@ pub mod plugin;
 pub mod plugins;
 pub mod query;
 pub mod screenshot;
-pub(crate) mod target;
+pub mod target;
 pub mod tracing;
 pub(crate) mod transport;
 pub mod types;
@@ -64,8 +64,8 @@ pub mod worker;
 
 pub use accessibility::{AXNode, Accessibility};
 pub use browser::{
-    Browser, BrowserConnector, BrowserLauncher, ConnectOptions, HeadlessMode, LaunchOptions,
-    VersionInfo,
+    Browser, BrowserConnector, BrowserEvent, BrowserLauncher, ConnectOptions, HeadlessMode,
+    LaunchOptions, VersionInfo,
 };
 pub use browser_context::BrowserContext;
 pub use cookie::{Cookie, DeleteCookieParams, SetCookieParams};
@@ -91,6 +91,7 @@ pub use plugin::{
 pub use plugins::{BlockResourcesPlugin, InitScriptPlugin, StealthEvasion, StealthPlugin};
 pub use query::{PollingMode, QueryHandler, QueryHandlerRegistry};
 pub use screenshot::{ClipRect, ImageFormat, PdfOptions, ScreenshotOptions};
+pub use target::{InitStatus, Target, TargetEvent, TargetInfo, TargetType};
 pub use tracing::{Tracing, TracingOptions};
 pub use types::{
     BoundingBox, BoxModel, ClickOptions, Credentials, DeviceDescriptor, EvaluationResult,

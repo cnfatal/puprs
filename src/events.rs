@@ -33,6 +33,7 @@
 
 use crate::dialog::DialogType;
 use crate::http::{HTTPRequest, HTTPResponse};
+use crate::page::Page;
 use crate::transport::CdpEvent;
 
 /// High-level page events, similar to Puppeteer's page event types.
@@ -65,6 +66,8 @@ pub enum PageEvent {
     Load,
     /// A `DOMContentLoaded` lifecycle event fired.
     DomContentLoaded,
+    /// A popup page was opened from this page.
+    Popup(Page),
 }
 
 /// A console message from the browser.
