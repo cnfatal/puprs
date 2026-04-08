@@ -53,6 +53,42 @@ impl Element {
         })
     }
 
+    /// Construct an Element from a BackendNodeId by resolving the remote object.
+    pub(crate) async fn from_backend_node_id(
+        page: &Page,
+        backend_node_id: BackendNodeId,
+    ) -> Result<Self> {
+        let resolve_resp = page
+            .execute(
+                ResolveNodeParams::builder()
+                    .backend_node_id(backend_node_id)
+                    .build(),
+            )
+            .await?;
+
+        let remote_object_id = resolve_resp.object.object_id.ok_or_else(|| {
+            Error::ElementNotFound(format!("no object id for backend node {backend_node_id:?}"))
+        })?;
+
+        let describe_resp = page
+            .execute(
+                DescribeNodeParams::builder()
+                    .backend_node_id(backend_node_id)
+                    .depth(0)
+                    .build(),
+            )
+            .await?;
+
+        let node_id = describe_resp.node.node_id;
+
+        Ok(Self {
+            remote_object_id,
+            backend_node_id,
+            node_id,
+            page: page.clone(),
+        })
+    }
+
     // ── Sub-element finding ─────────────────────────────────────────
 
     /// Find the first child element matching a CSS selector.

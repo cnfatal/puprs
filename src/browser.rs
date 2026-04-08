@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::Notify;
 
 use crate::cdp::browser_protocol::browser::{CloseParams, GetVersionParams};
 use crate::cdp::browser_protocol::network::{
@@ -16,8 +17,10 @@ use crate::cookie::{Cookie, SetCookieParams};
 use crate::error::{Error, Result};
 use crate::page::Page;
 use crate::plugin::{Plugin, PluginManager};
+use crate::query::QueryHandlerRegistry;
 use crate::target::TargetManager;
 use crate::transport::Transport;
+use crate::types::Viewport;
 
 /// Browser headless mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -119,6 +122,9 @@ pub struct LaunchOptions {
 pub struct BrowserLauncher {
     options: LaunchOptions,
     plugins: Vec<Arc<dyn Plugin>>,
+    /// Default viewport. `None` = disabled (use real window size),
+    /// `Some(v)` = apply viewport on each new page.
+    default_viewport: Option<Viewport>,
 }
 
 impl Default for BrowserLauncher {
@@ -151,6 +157,14 @@ impl Default for BrowserLauncher {
         Self {
             options,
             plugins: Vec::new(),
+            default_viewport: Some(Viewport {
+                width: 800,
+                height: 600,
+                device_scale_factor: None,
+                is_mobile: None,
+                has_touch: None,
+                is_landscape: None,
+            }),
         }
     }
 }
@@ -221,6 +235,13 @@ impl BrowserLauncher {
         self
     }
 
+    /// Set the default viewport. Pass `None` to disable viewport emulation
+    /// (use real browser window size, aligned with Puppeteer `defaultViewport: null`).
+    pub fn default_viewport(mut self, viewport: Option<Viewport>) -> Self {
+        self.default_viewport = viewport;
+        self
+    }
+
     /// Launch the browser process, connect, and return a `Browser`.
     pub async fn launch(mut self) -> Result<Browser> {
         let plugin_manager = PluginManager::from_plugins(self.plugins.clone());
@@ -280,12 +301,20 @@ impl BrowserLauncher {
 
         plugin_manager.on_browser_ready().await?;
 
+        let query_handlers = QueryHandlerRegistry::with_builtins();
+
         Ok(Browser {
-            target_manager,
-            plugin_manager,
-            process: Some(process),
-            debug_ws_url: ws_url,
-            transport_handle: Some(transport_handle),
+            inner: Arc::new(BrowserInner {
+                target_manager,
+                plugin_manager,
+                process: tokio::sync::Mutex::new(Some(process)),
+                debug_ws_url: ws_url,
+                transport_handle: tokio::sync::Mutex::new(Some(transport_handle)),
+                disconnected: Arc::new(Notify::new()),
+                is_connected: false,
+                query_handlers,
+                default_viewport: self.default_viewport,
+            }),
         })
     }
 }
@@ -332,44 +361,83 @@ impl BrowserConnector {
 
         plugin_manager.on_browser_ready().await?;
 
+        let query_handlers = QueryHandlerRegistry::with_builtins();
+
         Ok(Browser {
-            target_manager,
-            plugin_manager,
-            process: None,
-            debug_ws_url: self.options.websocket_url.clone(),
-            transport_handle: Some(transport_handle),
+            inner: Arc::new(BrowserInner {
+                target_manager,
+                plugin_manager,
+                process: tokio::sync::Mutex::new(None),
+                debug_ws_url: self.options.websocket_url.clone(),
+                transport_handle: tokio::sync::Mutex::new(Some(transport_handle)),
+                disconnected: Arc::new(Notify::new()),
+                is_connected: true,
+                query_handlers,
+                default_viewport: None,
+            }),
         })
     }
 }
 
 // ── Browser ─────────────────────────────────────────────────────────
 
-/// A running browser instance.
-pub struct Browser {
+/// Internal state shared via Arc.
+pub(crate) struct BrowserInner {
     target_manager: TargetManager,
     plugin_manager: PluginManager,
-    process: Option<BrowserProcess>,
+    process: tokio::sync::Mutex<Option<BrowserProcess>>,
     debug_ws_url: String,
-    transport_handle: Option<tokio::task::JoinHandle<()>>,
+    transport_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Disconnect notification.
+    disconnected: Arc<Notify>,
+    /// Whether this browser was created via `connect()` (not `launch()`).
+    is_connected: bool,
+    /// Query handler registry (shared with all Pages).
+    pub(crate) query_handlers: QueryHandlerRegistry,
+    /// Default viewport for new pages. `None` = disabled.
+    pub(crate) default_viewport: Option<Viewport>,
+}
+
+/// A running browser instance. Clone is cheap (Arc handle).
+#[derive(Clone)]
+pub struct Browser {
+    pub(crate) inner: Arc<BrowserInner>,
 }
 
 impl std::fmt::Debug for Browser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Browser")
-            .field("ws_url", &self.debug_ws_url)
+            .field("ws_url", &self.inner.debug_ws_url)
             .finish()
     }
 }
 
+/// Full browser version info (aligned with CDP `Browser.getVersion` response).
+#[derive(Debug, Clone)]
+pub struct VersionInfo {
+    pub protocol_version: String,
+    pub product: String,
+    pub revision: String,
+    pub user_agent: String,
+    pub js_version: String,
+}
+
 impl Browser {
-    pub fn plugins(&mut self) -> &mut PluginManager {
-        &mut self.plugin_manager
+    /// Get the query handler registry (for registering/unregistering custom handlers).
+    pub fn query_handlers(&self) -> &QueryHandlerRegistry {
+        &self.inner.query_handlers
+    }
+
+    pub fn plugins(&self) -> &PluginManager {
+        &self.inner.plugin_manager
     }
 
     pub async fn new_page(&self) -> Result<Page> {
         Page::create(
-            &self.target_manager,
-            Some(Arc::new(self.plugin_manager.clone())),
+            &self.inner.target_manager,
+            Some(Arc::new(self.inner.plugin_manager.clone())),
+            self.inner.query_handlers.clone(),
+            self.inner.default_viewport,
         )
         .await
     }
@@ -377,6 +445,7 @@ impl Browser {
     /// Create a new isolated browser context.
     pub async fn create_browser_context(&self) -> Result<BrowserContext> {
         let resp = self
+            .inner
             .target_manager
             .transport()
             .send_command(
@@ -387,35 +456,72 @@ impl Browser {
 
         Ok(BrowserContext::new(
             resp.browser_context_id,
-            self.target_manager.clone(),
-            Some(Arc::new(self.plugin_manager.clone())),
-            self.target_manager.transport().clone(),
+            self.inner.target_manager.clone(),
+            Some(Arc::new(self.inner.plugin_manager.clone())),
+            self.inner.target_manager.transport().clone(),
         ))
     }
 
     pub fn websocket_address(&self) -> &str {
-        &self.debug_ws_url
+        &self.inner.debug_ws_url
     }
 
     /// Close the browser gracefully and clean up all resources.
-    pub async fn close(mut self) {
-        let transport = self.target_manager.transport();
+    ///
+    /// - `launch()` mode: sends CDP `Browser.close`, shuts down transport, kills process.
+    /// - `connect()` mode: only disconnects (does not affect the browser process).
+    pub async fn close(&self) {
+        if self.inner.is_connected {
+            self.disconnect().await;
+            return;
+        }
+
+        let transport = self.inner.target_manager.transport();
 
         // Try graceful CDP close, ignore errors
         let _ = transport.send_command(CloseParams::default(), None).await;
         transport.shutdown();
 
-        if let Some(h) = self.transport_handle.take() {
+        if let Some(h) = self.inner.transport_handle.lock().await.take() {
             let _ = h.await;
         }
 
-        if let Some(mut process) = self.process.take() {
+        if let Some(mut process) = self.inner.process.lock().await.take() {
             process.shutdown().await;
         }
+
+        self.inner.disconnected.notify_waiters();
     }
 
-    pub async fn get_cookies(&self) -> Result<Vec<Cookie>> {
+    /// Disconnect the WebSocket connection without closing the browser process.
+    pub async fn disconnect(&self) {
+        let transport = self.inner.target_manager.transport();
+        transport.shutdown();
+
+        if let Some(h) = self.inner.transport_handle.lock().await.take() {
+            let _ = h.await;
+        }
+
+        self.inner.disconnected.notify_waiters();
+    }
+
+    /// Wait for the browser connection to close (user close, crash, disconnect, etc.).
+    pub async fn wait_closed(&self) {
+        self.inner.target_manager.transport().wait_closed().await;
+        self.inner.disconnected.notify_waiters();
+    }
+
+    /// Check if the browser connection is still alive.
+    pub fn is_connected(&self) -> bool {
+        self.inner.target_manager.transport().is_connected()
+    }
+
+    // ── Cookie API (aligned with Puppeteer naming) ──────────────────
+
+    /// Get all cookies (aligned with Puppeteer `browser.cookies()`).
+    pub async fn cookies(&self) -> Result<Vec<Cookie>> {
         let resp = self
+            .inner
             .target_manager
             .transport()
             .send_command(NetworkGetCookiesParams::default(), None)
@@ -423,52 +529,67 @@ impl Browser {
         Ok(resp.cookies.into_iter().map(Cookie::from).collect())
     }
 
-    pub async fn set_cookies(&self, cookies: Vec<SetCookieParams>) -> Result<()> {
+    /// Set cookies (aligned with Puppeteer `browser.setCookie(...cookies)`).
+    pub async fn set_cookie(&self, cookies: Vec<SetCookieParams>) -> Result<()> {
         let params: Vec<_> = cookies.into_iter().map(Into::into).collect();
-        self.target_manager
+        self.inner
+            .target_manager
             .transport()
             .send_command(NetworkSetCookiesParams::new(params), None)
             .await?;
         Ok(())
     }
 
+    /// Clear all cookies (aligned with Puppeteer API).
     pub async fn clear_cookies(&self) -> Result<()> {
-        self.target_manager
+        self.inner
+            .target_manager
             .transport()
             .send_command(ClearCookiesParams::default(), None)
             .await?;
         Ok(())
     }
 
-    pub async fn user_agent(&self) -> Result<String> {
-        let resp = self
-            .target_manager
-            .transport()
-            .send_command(GetVersionParams::default(), None)
-            .await?;
-        Ok(resp.user_agent)
-    }
+    // ── Version API ─────────────────────────────────────────────────
 
-    /// Return the browser version string (e.g. "Chrome/120.0.6099.109").
+    /// Get the browser version string (aligned with Puppeteer `browser.version()`).
     pub async fn version(&self) -> Result<String> {
+        let info = self.version_info().await?;
+        Ok(info.product)
+    }
+
+    /// Get full browser version info.
+    pub async fn version_info(&self) -> Result<VersionInfo> {
         let resp = self
+            .inner
             .target_manager
             .transport()
             .send_command(GetVersionParams::default(), None)
             .await?;
-        Ok(resp.product)
+        Ok(VersionInfo {
+            protocol_version: resp.protocol_version,
+            product: resp.product,
+            revision: resp.revision,
+            user_agent: resp.user_agent,
+            js_version: resp.js_version,
+        })
     }
 
-    /// Return all current page targets as `Page` objects.
-    pub async fn pages(&self) -> Result<Vec<Page>> {
-        let targets = self.target_manager.page_targets().await?;
-        Ok(targets.into_iter().map(Page::new).collect())
+    /// Get browser User-Agent (aligned with Puppeteer `browser.userAgent()`).
+    pub async fn user_agent(&self) -> Result<String> {
+        let info = self.version_info().await?;
+        Ok(info.user_agent)
+    }
+
+    /// Return all current page targets as `Page` objects (zero CDP calls).
+    pub async fn pages(&self) -> Vec<Page> {
+        self.inner.target_manager.pages().await
     }
 }
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        self.target_manager.transport().shutdown();
+        self.inner.target_manager.transport().shutdown();
         // BrowserProcess::Drop handles child kill + temp dir cleanup
     }
 }

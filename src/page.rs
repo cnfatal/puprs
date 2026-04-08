@@ -7,11 +7,7 @@ use tokio::sync::OnceCell;
 
 use crate::cdp::Command;
 use crate::cdp::browser_protocol::dom::{
-    DescribeNodeParams, GetDocumentParams, Node, NodeId, QuerySelectorAllParams,
-    QuerySelectorParams,
-};
-use crate::cdp::browser_protocol::dom::{
-    DiscardSearchResultsParams, GetSearchResultsParams, PerformSearchParams,
+    BackendNodeId, DescribeNodeParams, GetDocumentParams, Node, NodeId,
 };
 use crate::cdp::browser_protocol::emulation::{
     MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
@@ -31,6 +27,7 @@ use crate::cdp::browser_protocol::network::{
 };
 use crate::cdp::browser_protocol::page::GetLayoutMetricsReturns;
 use crate::cdp::browser_protocol::page::HandleJavaScriptDialogParams;
+use crate::cdp::browser_protocol::page::SetInterceptFileChooserDialogParams;
 use crate::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, BringToFrontParams, CaptureScreenshotParams,
     CloseParams as PageCloseParams, EnableParams as PageEnableParams, GetNavigationHistoryParams,
@@ -54,6 +51,7 @@ use crate::frame::FrameManager;
 use crate::lifecycle::{LifecycleWatchOptions, LifecycleWatcher};
 use crate::network::NetworkManager;
 use crate::plugin::{PageCreatedContext, PluginManager};
+use crate::query::QueryHandlerRegistry;
 use crate::screenshot::{PdfOptions, ScreenshotOptions};
 use crate::target::{Target, TargetManager};
 use crate::tracing::Tracing;
@@ -69,6 +67,7 @@ use crate::worker::{WebWorker, WorkerType};
 pub struct Page {
     pub(crate) target: Target,
     pub(crate) plugins: Option<Arc<PluginManager>>,
+    pub(crate) query_handlers: QueryHandlerRegistry,
     frames: Arc<OnceCell<FrameManager>>,
     closed: Arc<AtomicBool>,
     network: Arc<tokio::sync::RwLock<NetworkManager>>,
@@ -82,6 +81,7 @@ impl Page {
         Self {
             target,
             plugins: None,
+            query_handlers: QueryHandlerRegistry::with_builtins(),
             frames: Arc::new(OnceCell::new()),
             closed: Arc::new(AtomicBool::new(false)),
             network,
@@ -92,12 +92,16 @@ impl Page {
     pub(crate) async fn create(
         targets: &TargetManager,
         plugins: Option<Arc<PluginManager>>,
+        query_handlers: QueryHandlerRegistry,
+        default_viewport: Option<Viewport>,
     ) -> Result<Self> {
         // Always bootstrap on about:blank so plugin init hooks can run before first real navigation.
         let target = targets.create_target("about:blank", None).await?;
 
         // Build Page object
-        let page = Page::new(target).with_plugins(plugins);
+        let page = Page::new(target)
+            .with_plugins(plugins)
+            .with_query_handlers(query_handlers);
 
         // Initialize domains
         page.enable_page_domain().await?;
@@ -111,6 +115,11 @@ impl Page {
         if let Some(pm) = &page.plugins {
             pm.on_page_created(&page, PageCreatedContext::default())
                 .await?;
+        }
+
+        // Apply default viewport if set
+        if let Some(viewport) = default_viewport {
+            page.set_viewport(viewport).await?;
         }
 
         Ok(page)
@@ -135,6 +144,11 @@ impl Page {
 
     pub(crate) fn with_plugins(mut self, plugins: Option<Arc<PluginManager>>) -> Self {
         self.plugins = plugins;
+        self
+    }
+
+    pub(crate) fn with_query_handlers(mut self, query_handlers: QueryHandlerRegistry) -> Self {
+        self.query_handlers = query_handlers;
         self
     }
 
@@ -640,65 +654,32 @@ impl Page {
 
     // ── Element finding ─────────────────────────────────────────────
 
-    /// Get the document root node ID.
-    async fn get_document_root_node_id(&self) -> Result<crate::cdp::browser_protocol::dom::NodeId> {
-        let resp = self.execute(GetDocumentParams::default()).await?;
-        Ok(resp.root.node_id)
-    }
-
-    /// Find the first element matching a CSS selector or a custom query handler.
+    /// Find the first element matching a selector.
     ///
-    /// If the selector contains a `/` and the prefix matches a registered
-    /// [`CustomQueryHandler`](crate::query::CustomQueryHandler), the
-    /// handler's `query_one` JS function is used instead of `DOM.querySelector`.
+    /// Supports CSS, XPath (`xpath/...`), text (`text/...`), aria (`aria/...`),
+    /// pierce (`pierce/...`), and custom registered handlers via the
+    /// [`QueryHandlerRegistry`].
     pub async fn find_element(&self, selector: impl Into<String>) -> Result<Element> {
         let selector = selector.into();
-
-        // Check for a custom query handler ("prefix/rest" format).
-        if let Some((handler, rest)) = crate::query::resolve_query_handler(&selector) {
-            return self.custom_query_one(&handler.query_one, &rest).await;
-        }
-
-        let root_id = self.get_document_root_node_id().await?;
-        let resp = self
-            .execute(QuerySelectorParams::new(root_id, selector.clone()))
-            .await?;
-
-        let node_id = resp.node_id;
-        Element::from_node_id(self, node_id).await
+        let resolved = self.query_handlers.resolve_selector(&selector);
+        self.eval_query_one(&resolved.handler.resolved_query_one(), &resolved.selector)
+            .await
     }
 
-    /// Find all elements matching a CSS selector or a custom query handler.
+    /// Find all elements matching a selector.
     ///
-    /// If the selector contains a `/` and the prefix matches a registered
-    /// [`CustomQueryHandler`](crate::query::CustomQueryHandler), the
-    /// handler's `query_all` JS function is used instead of `DOM.querySelectorAll`.
+    /// Supports CSS, XPath (`xpath/...`), text (`text/...`), aria (`aria/...`),
+    /// pierce (`pierce/...`), and custom registered handlers via the
+    /// [`QueryHandlerRegistry`].
     pub async fn find_elements(&self, selector: impl Into<String>) -> Result<Vec<Element>> {
         let selector = selector.into();
-
-        // Check for a custom query handler ("prefix/rest" format).
-        if let Some((handler, rest)) = crate::query::resolve_query_handler(&selector) {
-            return self.custom_query_all(&handler.query_all, &rest).await;
-        }
-
-        let root_id = self.get_document_root_node_id().await?;
-        let resp = self
-            .execute(QuerySelectorAllParams::new(root_id, selector))
-            .await?;
-
-        let mut elements = Vec::with_capacity(resp.node_ids.len());
-        for node_id in resp.node_ids {
-            match Element::from_node_id(self, node_id).await {
-                Ok(el) => elements.push(el),
-                Err(_) => continue,
-            }
-        }
-        Ok(elements)
+        let resolved = self.query_handlers.resolve_selector(&selector);
+        self.eval_query_all(&resolved.handler.resolved_query_all(), &resolved.selector)
+            .await
     }
 
-    /// Execute a custom query handler's `query_one` JS body and return the
-    /// matching element, if any.
-    async fn custom_query_one(&self, query_one_body: &str, selector: &str) -> Result<Element> {
+    /// Execute a query handler's `query_one` JS body and return the matching element.
+    async fn eval_query_one(&self, query_one_body: &str, selector: &str) -> Result<Element> {
         let js = format!(
             "() => {{ const queryOne = function(element, selector) {{ {} }}; return queryOne(document, {}); }}",
             query_one_body,
@@ -729,9 +710,7 @@ impl Page {
         }
 
         let object_id = resp.result.object_id.ok_or_else(|| {
-            Error::ElementNotFound(format!(
-                "custom query handler returned no element for: {selector}"
-            ))
+            Error::ElementNotFound(format!("query handler returned no element for: {selector}"))
         })?;
 
         // Resolve the RemoteObjectId into a full Element.
@@ -751,9 +730,8 @@ impl Page {
         })
     }
 
-    /// Execute a custom query handler's `query_all` JS body and return all
-    /// matching elements.
-    async fn custom_query_all(&self, query_all_body: &str, selector: &str) -> Result<Vec<Element>> {
+    /// Execute a query handler's `query_all` JS body and return all matching elements.
+    async fn eval_query_all(&self, query_all_body: &str, selector: &str) -> Result<Vec<Element>> {
         let js = format!(
             "() => {{ const queryAll = function(element, selector) {{ {} }}; return queryAll(document, {}); }}",
             query_all_body,
@@ -843,53 +821,6 @@ impl Page {
             });
         }
 
-        Ok(elements)
-    }
-
-    /// Find the first element matching an XPath expression.
-    pub async fn find_xpath(&self, selector: impl Into<String>) -> Result<Element> {
-        let results = self.find_xpaths(selector).await?;
-        results
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::ElementNotFound("no element found for xpath".into()))
-    }
-
-    /// Find all elements matching an XPath expression.
-    pub async fn find_xpaths(&self, selector: impl Into<String>) -> Result<Vec<Element>> {
-        let search = self
-            .execute(PerformSearchParams {
-                query: selector.into(),
-                include_user_agent_shadow_dom: Some(true),
-            })
-            .await?;
-
-        if search.result_count == 0 {
-            let _ = self
-                .execute(DiscardSearchResultsParams::new(search.search_id))
-                .await;
-            return Ok(Vec::new());
-        }
-
-        let results = self
-            .execute(GetSearchResultsParams::new(
-                search.search_id.clone(),
-                0,
-                search.result_count,
-            ))
-            .await?;
-
-        let _ = self
-            .execute(DiscardSearchResultsParams::new(search.search_id))
-            .await;
-
-        let mut elements = Vec::with_capacity(results.node_ids.len());
-        for node_id in results.node_ids {
-            match Element::from_node_id(self, node_id).await {
-                Ok(el) => elements.push(el),
-                Err(_) => continue,
-            }
-        }
         Ok(elements)
     }
 
@@ -1209,33 +1140,27 @@ impl Page {
         Ok(bytes)
     }
 
-    // ── Cookies ─────────────────────────────────────────────────────
+    // ── Cookies (aligned with Puppeteer naming) ───────────────────
 
-    /// Get all cookies for the current page URL.
-    pub async fn get_cookies(&self) -> Result<Vec<Cookie>> {
+    /// Get all cookies for the current page URL (aligned with Puppeteer `page.cookies()`).
+    pub async fn cookies(&self) -> Result<Vec<Cookie>> {
         let resp = self.execute(NetworkGetCookiesParams::default()).await?;
         Ok(resp.cookies.into_iter().map(Cookie::from).collect())
     }
 
-    /// Set a single cookie.
-    pub async fn set_cookie(&self, cookie: SetCookieParams) -> Result<&Self> {
-        let param: crate::cdp::browser_protocol::network::CookieParam = cookie.into();
-        self.execute(NetworkSetCookiesParams::new(vec![param]))
-            .await?;
-        Ok(self)
-    }
-
-    /// Set multiple cookies.
-    pub async fn set_cookies(&self, cookies: Vec<SetCookieParams>) -> Result<&Self> {
+    /// Set cookies (aligned with Puppeteer `page.setCookie(...cookies)`).
+    pub async fn set_cookie(&self, cookies: Vec<SetCookieParams>) -> Result<&Self> {
         let params: Vec<_> = cookies.into_iter().map(Into::into).collect();
         self.execute(NetworkSetCookiesParams::new(params)).await?;
         Ok(self)
     }
 
-    /// Delete a cookie.
-    pub async fn delete_cookie(&self, cookie: DeleteCookieParams) -> Result<&Self> {
-        let param: NetworkDeleteCookiesParams = cookie.into();
-        self.execute(param).await?;
+    /// Delete cookies (aligned with Puppeteer `page.deleteCookie(...cookies)`).
+    pub async fn delete_cookie(&self, cookies: Vec<DeleteCookieParams>) -> Result<&Self> {
+        for cookie in cookies {
+            let param: NetworkDeleteCookiesParams = cookie.into();
+            self.execute(param).await?;
+        }
         Ok(self)
     }
 
@@ -1814,18 +1739,24 @@ impl Page {
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Wait until an element matching the selector appears in the DOM.
+    ///
+    /// Supports CSS, XPath, text, aria, pierce, and custom handlers via the registry.
     pub async fn wait_for_selector(
         &self,
         selector: impl Into<String>,
         options: WaitForSelectorOptions,
     ) -> Result<Option<Element>> {
         let selector = selector.into();
+        let resolved = self.query_handlers.resolve_selector(&selector);
         let timeout = options.timeout.unwrap_or(Self::DEFAULT_TIMEOUT);
 
         let polling = if options.visible || options.hidden {
             PollingStrategy::Raf
         } else {
-            PollingStrategy::Mutation
+            match resolved.polling {
+                crate::query::PollingMode::Mutation => PollingStrategy::Mutation,
+                crate::query::PollingMode::Raf => PollingStrategy::Raf,
+            }
         };
 
         let visible_arg: serde_json::Value = if options.visible {
@@ -1836,16 +1767,27 @@ impl Page {
             serde_json::Value::Null
         };
 
-        let predicate = r#"function(util, selector, visible) {
-            const node = document.querySelector(selector);
-            return util.checkVisibility(node, visible);
-        }"#;
+        let predicate = format!(
+            r#"function(util, selector, visible) {{
+                const queryOne = function(element, selector) {{ {} }};
+                const node = queryOne(document, selector);
+                return util.checkVisibility(node, visible);
+            }}"#,
+            resolved.handler.resolved_query_one()
+        );
 
-        let args = vec![serde_json::json!(selector), visible_arg];
+        let args = vec![serde_json::json!(resolved.selector), visible_arg];
 
-        crate::wait::run_wait_task(self, predicate, &args, &polling, timeout).await?;
+        crate::wait::run_wait_task(self, &predicate, &args, &polling, timeout).await?;
 
-        match self.find_element(&selector).await {
+        // Rebuild full selector for find_element
+        let full_selector = if resolved.name == "css" {
+            resolved.selector.clone()
+        } else {
+            format!("{}={}", resolved.name, resolved.selector)
+        };
+
+        match self.find_element(&full_selector).await {
             Ok(el) => Ok(Some(el)),
             Err(_) if options.hidden => Ok(None),
             Err(e) => Err(e),
@@ -1866,6 +1808,64 @@ impl Page {
                 .await?;
 
         Ok(EvaluationResult::from_value(value))
+    }
+
+    /// Wait for a file chooser dialog to open (default 30s timeout).
+    ///
+    /// Must be called **before** the action that triggers the dialog.
+    pub async fn wait_for_file_chooser(&self) -> Result<crate::file_chooser::FileChooser> {
+        self.wait_for_file_chooser_with_timeout(Duration::from_secs(30))
+            .await
+    }
+
+    /// Wait for a file chooser dialog with a custom timeout.
+    pub async fn wait_for_file_chooser_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<crate::file_chooser::FileChooser> {
+        self.execute(SetInterceptFileChooserDialogParams::new(true))
+            .await?;
+
+        let mut rx = self.target.event_receiver();
+        let session_id = self.target.session_id().to_owned();
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Timeout("wait_for_file_chooser timed out".into()));
+            }
+
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(event)) => {
+                    if event.session_id.as_deref() != Some(&session_id) {
+                        continue;
+                    }
+                    if event.method != "Page.fileChooserOpened" {
+                        continue;
+                    }
+
+                    let backend_node_id = event.params["backendNodeId"]
+                        .as_i64()
+                        .ok_or_else(|| Error::Other("missing backendNodeId".into()))?;
+                    let mode = event.params["mode"].as_str().unwrap_or("selectSingle");
+                    let multiple = mode != "selectSingle";
+
+                    let element =
+                        Element::from_backend_node_id(self, BackendNodeId::new(backend_node_id))
+                            .await?;
+
+                    return Ok(crate::file_chooser::FileChooser::new(element, multiple));
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => {
+                    return Err(Error::Connection("event channel closed".into()));
+                }
+                Err(_) => {
+                    return Err(Error::Timeout("wait_for_file_chooser timed out".into()));
+                }
+            }
+        }
     }
 
     async fn build_navigation_watcher(

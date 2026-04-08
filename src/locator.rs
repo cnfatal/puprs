@@ -481,12 +481,18 @@ pub struct RaceLocator {
     locators: Vec<NodeLocator>,
 }
 
+/// Race result — includes the index of the winning locator.
+pub struct RaceResult {
+    pub index: usize,
+    pub element: Element,
+}
+
 impl RaceLocator {
     pub fn new(locators: Vec<NodeLocator>) -> Self {
         Self { locators }
     }
 
-    /// Convenience: race multiple CSS selectors on the same page.
+    /// Convenience: race multiple selectors on the same page.
     pub fn from_selectors(
         page: &Page,
         selectors: impl IntoIterator<Item = impl Into<String>>,
@@ -501,6 +507,12 @@ impl RaceLocator {
 
     /// Wait for the first locator to resolve.
     pub async fn wait_handle(&self) -> Result<Element> {
+        let result = self.wait_handle_with_index().await?;
+        Ok(result.element)
+    }
+
+    /// Wait for the first locator to resolve and return the index.
+    pub async fn wait_handle_with_index(&self) -> Result<RaceResult> {
         use futures::future::select_all;
 
         if self.locators.is_empty() {
@@ -510,7 +522,16 @@ impl RaceLocator {
         let futures: Vec<_> = self
             .locators
             .iter()
-            .map(|l| Box::pin(l.wait_handle()))
+            .enumerate()
+            .map(|(i, l)| {
+                Box::pin(async move {
+                    let el = l.wait_handle().await?;
+                    Ok::<_, Error>(RaceResult {
+                        index: i,
+                        element: el,
+                    })
+                })
+            })
             .collect();
         let (result, _index, _rest) = select_all(futures).await;
         result

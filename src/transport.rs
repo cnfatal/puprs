@@ -7,11 +7,13 @@
 
 use std::collections::VecDeque;
 
+use std::sync::Arc;
+
 use fnv::FnvHashMap;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::channel::oneshot;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use async_tungstenite::tungstenite::Message as WsMessage;
 use async_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -51,6 +53,8 @@ pub struct CdpEvent {
 pub(crate) struct Transport {
     tx: mpsc::UnboundedSender<TransportMessage>,
     event_tx: broadcast::Sender<CdpEvent>,
+    /// Notified when the WebSocket connection closes.
+    closed: Arc<Notify>,
 }
 
 impl std::fmt::Debug for Transport {
@@ -75,13 +79,19 @@ impl Transport {
 
         let (msg_tx, msg_rx) = mpsc::unbounded();
         let (event_tx, _event_rx) = broadcast::channel(256);
+        let closed = Arc::new(Notify::new());
+        let closed_clone = closed.clone();
 
         let transport = Transport {
             tx: msg_tx,
             event_tx: event_tx.clone(),
+            closed,
         };
 
-        let handle = tokio::spawn(transport_loop(ws, msg_rx, event_tx));
+        let handle = tokio::spawn(async move {
+            transport_loop(ws, msg_rx, event_tx).await;
+            closed_clone.notify_waiters();
+        });
 
         Ok((transport, handle))
     }
@@ -133,6 +143,16 @@ impl Transport {
     /// Send shutdown signal.
     pub fn shutdown(&self) {
         let _ = self.tx.unbounded_send(TransportMessage::Shutdown);
+    }
+
+    /// Wait for the WebSocket connection to close.
+    pub async fn wait_closed(&self) {
+        self.closed.notified().await;
+    }
+
+    /// Check if the connection is still alive.
+    pub fn is_connected(&self) -> bool {
+        !self.tx.is_closed()
     }
 }
 
