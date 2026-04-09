@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
+use tokio::sync::Notify;
 
 use crate::cdp::browser_protocol::fetch::{
     ContinueRequestParams, FailRequestParams, FulfillRequestParams, HeaderEntry,
@@ -64,6 +67,66 @@ pub struct HTTPResponse {
     pub(crate) request: Option<Box<HTTPRequest>>,
     /// Target for CDP commands (body fetching).
     pub(crate) target: Option<Target>,
+    /// Signalled when `Network.loadingFinished` (or `loadingFailed`) arrives,
+    /// meaning the response body is available (or failed). Mirrors Puppeteer's
+    /// `#bodyLoadedDeferred` in `CdpHTTPResponse`.
+    pub(crate) body_loaded: Arc<BodyLoaded>,
+}
+
+/// A one-shot latch that signals when the response body is available.
+///
+/// Unlike `tokio::sync::Notify`, this latch stays resolved once triggered,
+/// so callers that arrive after resolution return immediately.
+#[derive(Debug)]
+pub(crate) struct BodyLoaded {
+    resolved: AtomicBool,
+    error: std::sync::Mutex<Option<String>>,
+    notify: Notify,
+}
+
+impl BodyLoaded {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            resolved: AtomicBool::new(false),
+            error: std::sync::Mutex::new(None),
+            notify: Notify::new(),
+        })
+    }
+
+    /// Mark the body as loaded successfully.
+    pub(crate) fn resolve(&self) {
+        self.resolved.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Mark the body loading as failed.
+    pub(crate) fn reject(&self, error: String) {
+        *self.error.lock().unwrap() = Some(error);
+        self.resolved.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Wait until the body is available (or failed).
+    pub(crate) async fn wait(&self) -> crate::error::Result<()> {
+        loop {
+            if self.resolved.load(Ordering::Acquire) {
+                return self.check_error();
+            }
+            let notified = self.notify.notified();
+            // Re-check after registering interest to avoid TOCTOU race.
+            if self.resolved.load(Ordering::Acquire) {
+                return self.check_error();
+            }
+            notified.await;
+        }
+    }
+
+    fn check_error(&self) -> crate::error::Result<()> {
+        match self.error.lock().unwrap().as_ref() {
+            Some(err) => Err(crate::error::Error::NetworkError(err.clone())),
+            None => Ok(()),
+        }
+    }
 }
 
 impl HTTPRequest {
@@ -298,6 +361,7 @@ impl HTTPResponse {
                 .map(|v| v as u16),
             request: None,
             target: None,
+            body_loaded: BodyLoaded::new(),
         })
     }
 
@@ -317,11 +381,19 @@ impl HTTPResponse {
     }
 
     /// Get the response body as bytes.
+    ///
+    /// Waits for `Network.loadingFinished` (via [`BodyLoaded`]) before calling
+    /// `Network.getResponseBody`. This mirrors Puppeteer's
+    /// `#bodyLoadedDeferred` pattern in `CdpHTTPResponse`.
     pub async fn content(&self) -> Result<Vec<u8>> {
         let target = self
             .target
             .as_ref()
             .ok_or_else(|| Error::InvalidState("no target available for body fetch".into()))?;
+
+        // Wait for the response body to become available.
+        self.body_loaded.wait().await?;
+
         let params = GetResponseBodyParams::new(RequestId::new(self.request_id.clone()));
         let result = target.execute(params).await?;
         if result.base64_encoded {

@@ -61,6 +61,11 @@ impl NetworkManager {
         self.event_tx.subscribe()
     }
 
+    /// Return a clone of the broadcast sender for synchronous subscription.
+    pub(crate) fn event_sender(&self) -> &broadcast::Sender<NetworkEvent> {
+        &self.event_tx
+    }
+
     /// Look up a stored request by ID.
     pub(crate) fn get_request(&self, request_id: &str) -> Option<&HTTPRequest> {
         self.requests.get(request_id)
@@ -110,6 +115,12 @@ impl NetworkManager {
             }
             "Network.loadingFinished" => {
                 if let Some(request_id) = event.params.get("requestId").and_then(|v| v.as_str()) {
+                    // Resolve body-loaded for the response (mirrors Puppeteer's _resolveBody).
+                    if let Some(req) = self.requests.get(request_id) {
+                        if let Some(resp) = &req.response {
+                            resp.body_loaded.resolve();
+                        }
+                    }
                     self.inflight.remove(request_id);
                     self.last_activity = Instant::now();
                     let _ = self.event_tx.send(NetworkEvent::RequestFinished {
@@ -119,14 +130,20 @@ impl NetworkManager {
             }
             "Network.loadingFailed" => {
                 if let Some(request_id) = event.params.get("requestId").and_then(|v| v.as_str()) {
-                    self.inflight.remove(request_id);
-                    self.last_activity = Instant::now();
                     let error_text = event
                         .params
                         .get("errorText")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown error")
                         .to_owned();
+                    // Reject body-loaded so content() returns an error.
+                    if let Some(req) = self.requests.get(request_id) {
+                        if let Some(resp) = &req.response {
+                            resp.body_loaded.reject(error_text.clone());
+                        }
+                    }
+                    self.inflight.remove(request_id);
+                    self.last_activity = Instant::now();
                     let _ = self.event_tx.send(NetworkEvent::RequestFailed {
                         request_id: request_id.to_owned(),
                         error_text,

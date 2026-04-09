@@ -187,6 +187,83 @@ impl FrameManager {
         Ok(())
     }
 
+    /// Handle an OOP iframe target being attached.
+    ///
+    /// When Chrome puts an iframe into a separate process (OOP iframe), it
+    /// creates a new CDP target whose `targetId` matches the frame's `frameId`.
+    /// This method:
+    ///
+    /// 1. Verifies the target is of type "iframe".
+    /// 2. Spawns a new event-listener task on the iframe's session so that
+    ///    frame lifecycle / execution-context events from that session update
+    ///    the shared `FrameState`.
+    /// 3. Registers isolated worlds on the new session.
+    ///
+    /// This is the Rust equivalent of Puppeteer's
+    /// `FrameManager.onAttachedToTarget()`.
+    pub async fn on_attached_to_target(&self, target: &Target) -> Result<()> {
+        // Only process iframe-type targets.
+        if target.info.read().await.target_type != crate::target::TargetType::IFrame {
+            return Ok(());
+        }
+
+        let iframe_target_id = target.target_id().to_owned();
+        let iframe_frame_id = FrameId::new(iframe_target_id);
+
+        // Spawn an event-listener task for this iframe's session.
+        // Frame events (lifecycle, execution context, navigation) from the
+        // OOP iframe arrive on the iframe's own session.
+        let state = Arc::clone(&self.state);
+        let mut events = target.event_receiver();
+        let sid = target.session_id().to_owned();
+
+        tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                // Only process events for the iframe's session.
+                if event.session_id.as_deref() != Some(&sid) {
+                    continue;
+                }
+                let mut s = state.write().await;
+                handle_event(&mut s, &event);
+            }
+        });
+
+        // Re-create isolated worlds on the new session.
+        let world_names: Vec<String> = {
+            self.state
+                .read()
+                .await
+                .isolated_worlds
+                .iter()
+                .cloned()
+                .collect()
+        };
+        for world_name in &world_names {
+            // Register placeholder script on the new session
+            let add_script = AddScriptToEvaluateOnNewDocumentParams::builder()
+                .source(format!("//# sourceURL={world_name}"))
+                .world_name(world_name.as_str())
+                .build()
+                .map_err(Error::Other)?;
+            let _ = target.execute(add_script).await;
+
+            // Create the isolated world for the iframe's frame
+            let cmd = CreateIsolatedWorldParams {
+                frame_id: iframe_frame_id.clone(),
+                world_name: Some(world_name.clone()),
+                grant_univeral_access: Some(true),
+            };
+            let _ = target.execute(cmd).await;
+        }
+
+        // Enable lifecycle events on the iframe session.
+        let _ = target
+            .execute(SetLifecycleEventsEnabledParams { enabled: true })
+            .await;
+
+        Ok(())
+    }
+
     // ── Public queries ──────────────────────────────────────────────
 
     /// Return the main (top-level) frame id.

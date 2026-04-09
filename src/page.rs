@@ -1,9 +1,10 @@
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::cdp::Command;
 use crate::cdp::browser_protocol::dom::{
@@ -17,9 +18,7 @@ use crate::cdp::browser_protocol::emulation::{
 use crate::cdp::browser_protocol::fetch::{
     DisableParams as FetchDisableParams, EnableParams as FetchEnableParams, RequestPattern,
 };
-use crate::cdp::browser_protocol::input::{
-    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
-};
+
 use crate::cdp::browser_protocol::network::{
     DeleteCookiesParams as NetworkDeleteCookiesParams, EnableParams as NetworkEnableParams,
     GetCookiesParams as NetworkGetCookiesParams, SetCacheDisabledParams,
@@ -49,7 +48,7 @@ use crate::element::Element;
 use crate::error::{Error, Result};
 use crate::frame::FrameManager;
 use crate::lifecycle::{LifecycleWatchOptions, LifecycleWatcher};
-use crate::network::NetworkManager;
+use crate::network::{NetworkEvent, NetworkManager};
 use crate::plugin::{PageCreatedContext, PluginManager};
 use crate::query::QueryHandlerRegistry;
 use crate::screenshot::{PdfOptions, ScreenshotOptions};
@@ -71,13 +70,29 @@ pub struct Page {
     frames: Arc<OnceCell<FrameManager>>,
     closed: Arc<AtomicBool>,
     network: Arc<tokio::sync::RwLock<NetworkManager>>,
+    /// Broadcast sender for NetworkManager events, kept here for synchronous
+    /// subscription in `wait_for_request` / `wait_for_response`.
+    network_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
+    keyboard: Arc<Mutex<crate::input::Keyboard>>,
+    mouse: Arc<Mutex<crate::input::Mouse>>,
+    touchscreen: Arc<Mutex<crate::input::Touchscreen>>,
 }
 
 impl Page {
     pub(crate) fn new(target: Target) -> Self {
         let mut nm = NetworkManager::new(target.session_id.clone());
         nm.set_target(target.clone());
+        let network_tx = nm.event_sender().clone();
         let network = Arc::new(tokio::sync::RwLock::new(nm));
+        let keyboard = Arc::new(Mutex::new(crate::input::Keyboard::new(target.clone())));
+        let mouse = Arc::new(Mutex::new(crate::input::Mouse::new(
+            target.clone(),
+            keyboard.clone(),
+        )));
+        let touchscreen = Arc::new(Mutex::new(crate::input::Touchscreen::new(
+            target.clone(),
+            keyboard.clone(),
+        )));
         Self {
             target,
             plugins: None,
@@ -85,6 +100,10 @@ impl Page {
             frames: Arc::new(OnceCell::new()),
             closed: Arc::new(AtomicBool::new(false)),
             network,
+            network_tx,
+            keyboard,
+            mouse,
+            touchscreen,
         }
     }
 
@@ -110,6 +129,9 @@ impl Page {
 
         // Start the background network event processor.
         page.start_network_manager();
+
+        // Start the OOP iframe listener.
+        page.start_oop_iframe_listener();
 
         // Plugin hooks for page
         if let Some(pm) = &page.plugins {
@@ -137,6 +159,72 @@ impl Page {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
+                }
+            }
+        });
+    }
+
+    /// Spawn a background task that listens for OOP iframe target attachments.
+    ///
+    /// When Chrome moves an iframe into a separate process (OOP iframe), it
+    /// sends `Target.attachedToTarget` on the page's session. This task
+    /// catches those events and forwards them to the [`FrameManager`] so that
+    /// frame-level events from the iframe's own session are tracked.
+    fn start_oop_iframe_listener(&self) {
+        let mut events = self.target.event_receiver();
+        let page_session_id = self.target.session_id.clone();
+        let transport = self.target.transport.clone();
+        let frames = Arc::clone(&self.frames);
+
+        tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                // Only process attachedToTarget events addressed to this page's session.
+                if event.method != "Target.attachedToTarget" {
+                    continue;
+                }
+                if event.session_id.as_deref() != Some(&page_session_id) {
+                    continue;
+                }
+
+                // Parse the new child target info.
+                let child_session_id = event
+                    .params
+                    .get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                let target_info = event
+                    .params
+                    .get("targetInfo")
+                    .and_then(|ti| ti.get("type"))
+                    .and_then(|t| t.as_str());
+
+                // Only handle iframe targets.
+                if target_info != Some("iframe") {
+                    continue;
+                }
+
+                let Some(child_sid) = child_session_id else {
+                    continue;
+                };
+                let Some(child_target_id) = event
+                    .params
+                    .get("targetInfo")
+                    .and_then(|ti| ti.get("targetId"))
+                    .and_then(|t| t.as_str())
+                    .map(String::from)
+                else {
+                    continue;
+                };
+
+                let child_target = crate::target::Target::new_simple(
+                    transport.clone(),
+                    child_sid,
+                    child_target_id,
+                );
+
+                // Forward to FrameManager if it is already initialized.
+                if let Some(fm) = frames.get() {
+                    let _ = fm.on_attached_to_target(&child_target).await;
                 }
             }
         });
@@ -311,40 +399,49 @@ impl Page {
     ///
     /// Returns an [`HTTPRequest`] with `interception_id` set, which can be
     /// continued, responded to, or aborted.
-    pub async fn wait_for_intercepted_request(
+    ///
+    /// The broadcast receiver is created synchronously at call time, so it is
+    /// safe to set up the waiter before triggering the action that produces the
+    /// request.
+    pub fn wait_for_intercepted_request(
         &self,
-        predicate: impl Fn(&HTTPRequest) -> bool,
+        predicate: impl Fn(&HTTPRequest) -> bool + Send + 'static,
         timeout: Duration,
-    ) -> Result<HTTPRequest> {
+    ) -> impl Future<Output = Result<HTTPRequest>> + Send + 'static {
         let mut events = self.target.transport.event_receiver();
         let session_id = self.target.session_id.clone();
         let target = self.target.clone();
-        let deadline = tokio::time::Instant::now() + timeout;
 
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Timeout(
-                    "waiting for intercepted request timed out".into(),
-                ));
-            }
+        async move {
+            let deadline = tokio::time::Instant::now() + timeout;
 
-            let event = tokio::time::timeout(remaining, events.recv())
-                .await
-                .map_err(|_| Error::Timeout("waiting for intercepted request timed out".into()))?
-                .map_err(|e| Error::Other(e.to_string()))?;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(Error::Timeout(
+                        "waiting for intercepted request timed out".into(),
+                    ));
+                }
 
-            if event.session_id.as_deref() != Some(&session_id) {
-                continue;
-            }
-            if event.method != "Fetch.requestPaused" {
-                continue;
-            }
+                let event = tokio::time::timeout(remaining, events.recv())
+                    .await
+                    .map_err(|_| {
+                        Error::Timeout("waiting for intercepted request timed out".into())
+                    })?
+                    .map_err(|e| Error::Other(e.to_string()))?;
 
-            if let Some(request) = HTTPRequest::from_fetch_paused(&event.params) {
-                let request = request.with_target(target.clone());
-                if predicate(&request) {
-                    return Ok(request);
+                if event.session_id.as_deref() != Some(&session_id) {
+                    continue;
+                }
+                if event.method != "Fetch.requestPaused" {
+                    continue;
+                }
+
+                if let Some(request) = HTTPRequest::from_fetch_paused(&event.params) {
+                    let request = request.with_target(target.clone());
+                    if predicate(&request) {
+                        return Ok(request);
+                    }
                 }
             }
         }
@@ -995,107 +1092,43 @@ impl Page {
             x: point.x + options.offset.map(|o| o.x).unwrap_or(0.0),
             y: point.y + options.offset.map(|o| o.y).unwrap_or(0.0),
         };
-        self.move_mouse(target).await?;
-
-        for i in 1..=options.click_count {
-            self.execute(
-                DispatchMouseEventParams::builder()
-                    .x(target.x)
-                    .y(target.y)
-                    .r#type(DispatchMouseEventType::MousePressed)
-                    .button(options.button.clone())
-                    .click_count(i64::from(i))
-                    .build()
-                    .map_err(|e| Error::Other(e.to_string()))?,
+        let mut mouse = self.mouse.lock().await;
+        mouse
+            .click(
+                target.x,
+                target.y,
+                Some(crate::input::MouseClickOptions {
+                    button: options.button,
+                    count: options.click_count,
+                    delay: if options.delay.is_zero() {
+                        None
+                    } else {
+                        Some(options.delay)
+                    },
+                }),
             )
             .await?;
-
-            if !options.delay.is_zero() {
-                tokio::time::sleep(options.delay).await;
-            }
-
-            self.execute(
-                DispatchMouseEventParams::builder()
-                    .x(target.x)
-                    .y(target.y)
-                    .r#type(DispatchMouseEventType::MouseReleased)
-                    .button(options.button.clone())
-                    .click_count(i64::from(i))
-                    .build()
-                    .map_err(|e| Error::Other(e.to_string()))?,
-            )
-            .await?;
-        }
-
         Ok(self)
     }
 
     /// Move the mouse to the given point.
     pub async fn move_mouse(&self, point: Point) -> Result<&Self> {
-        self.execute(DispatchMouseEventParams::new(
-            DispatchMouseEventType::MouseMoved,
-            point.x,
-            point.y,
-        ))
-        .await?;
+        let mut mouse = self.mouse.lock().await;
+        mouse.move_to(point.x, point.y, None).await?;
         Ok(self)
     }
 
     /// Type text character by character.
     pub(crate) async fn type_str(&self, input: impl AsRef<str>) -> Result<&Self> {
-        for c in input.as_ref().chars() {
-            let text = c.to_string();
-            self.execute(
-                DispatchKeyEventParams::builder()
-                    .r#type(DispatchKeyEventType::KeyDown)
-                    .text(&text)
-                    .key(&text)
-                    .build()
-                    .map_err(|e| Error::Other(e.to_string()))?,
-            )
-            .await?;
-            self.execute(
-                DispatchKeyEventParams::builder()
-                    .r#type(DispatchKeyEventType::KeyUp)
-                    .key(&text)
-                    .build()
-                    .map_err(|e| Error::Other(e.to_string()))?,
-            )
-            .await?;
-        }
+        let mut kb = self.keyboard.lock().await;
+        kb.type_text(input, None).await?;
         Ok(self)
     }
 
     /// Press a key (e.g. "Enter", "Tab").
     pub(crate) async fn press_key(&self, key: impl AsRef<str>) -> Result<&Self> {
-        let key = key.as_ref();
-
-        let (event_type, text) = if key.len() == 1 {
-            (DispatchKeyEventType::KeyDown, Some(key.to_string()))
-        } else {
-            (DispatchKeyEventType::RawKeyDown, None)
-        };
-
-        let mut builder = DispatchKeyEventParams::builder()
-            .r#type(event_type)
-            .key(key);
-
-        if let Some(ref t) = text {
-            builder = builder.text(t);
-        }
-
-        self.execute(builder.build().map_err(|e| Error::Other(e.to_string()))?)
-            .await?;
-
-        self.execute(
-            DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyUp)
-                .key(key)
-                .build()
-                .map_err(|e| Error::Other(e.to_string()))?,
-        )
-        .await?;
-
+        let mut kb = self.keyboard.lock().await;
+        kb.press(key, None).await?;
         Ok(self)
     }
 
@@ -1199,75 +1232,92 @@ impl Page {
     }
 
     /// Wait for the next network request matching the predicate.
-    pub async fn wait_for_request(
+    ///
+    /// Subscribes to [`NetworkEvent::Request`] from the [`NetworkManager`],
+    /// so the returned [`HTTPRequest`] has its target already set.
+    ///
+    /// The broadcast receiver is created **synchronously** when this method is
+    /// called, so it is safe to set up the waiter *before* triggering the
+    /// action that produces the request:
+    ///
+    /// ```rust,ignore
+    /// let req_future = page.wait_for_request(|r| r.url.contains("/api"), timeout);
+    /// page.goto(url).await?;
+    /// let req = req_future.await?;
+    /// ```
+    pub fn wait_for_request(
         &self,
-        predicate: impl Fn(&crate::http::HTTPRequest) -> bool,
+        predicate: impl Fn(&crate::http::HTTPRequest) -> bool + Send + 'static,
         timeout: std::time::Duration,
-    ) -> Result<crate::http::HTTPRequest> {
-        let mut rx = self.target.event_receiver();
-        let session_id = self.target.session_id.clone();
-        let deadline = tokio::time::Instant::now() + timeout;
+    ) -> impl Future<Output = Result<crate::http::HTTPRequest>> + Send + 'static {
+        let mut rx = self.network_tx.subscribe();
 
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Timeout("wait_for_request timed out".into()));
-            }
+        async move {
+            let deadline = tokio::time::Instant::now() + timeout;
 
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(event)) => {
-                    if event.session_id.as_deref() != Some(&session_id) {
-                        continue;
-                    }
-                    if event.method != "Network.requestWillBeSent" {
-                        continue;
-                    }
-                    if let Some(req) = crate::http::HTTPRequest::from_cdp_event(&event.params) {
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(Error::Timeout("wait_for_request timed out".into()));
+                }
+
+                match tokio::time::timeout(remaining, rx.recv()).await {
+                    Ok(Ok(NetworkEvent::Request(req))) => {
                         if predicate(&req) {
-                            return Ok(req.with_target(self.target.clone()));
+                            return Ok(req);
                         }
                     }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(_)) => return Err(Error::Connection("event channel closed".into())),
+                    Err(_) => return Err(Error::Timeout("wait_for_request timed out".into())),
                 }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(_)) => return Err(Error::Connection("event channel closed".into())),
-                Err(_) => return Err(Error::Timeout("wait_for_request timed out".into())),
             }
         }
     }
 
     /// Wait for the next network response matching the predicate.
-    pub async fn wait_for_response(
+    ///
+    /// Subscribes to [`NetworkEvent::Response`] from the [`NetworkManager`],
+    /// so the returned [`HTTPResponse`] shares the same `body_loaded` latch
+    /// that NetworkManager resolves on `Network.loadingFinished`.
+    ///
+    /// The broadcast receiver is created **synchronously** when this method is
+    /// called, so it is safe to set up the waiter *before* triggering the
+    /// action that produces the response:
+    ///
+    /// ```rust,ignore
+    /// let resp_future = page.wait_for_response(|r| r.url.contains("/api"), timeout);
+    /// page.goto(url).await?;
+    /// let resp = resp_future.await?;
+    /// ```
+    pub fn wait_for_response(
         &self,
-        predicate: impl Fn(&crate::http::HTTPResponse) -> bool,
+        predicate: impl Fn(&crate::http::HTTPResponse) -> bool + Send + 'static,
         timeout: std::time::Duration,
-    ) -> Result<crate::http::HTTPResponse> {
-        let mut rx = self.target.event_receiver();
-        let session_id = self.target.session_id.clone();
-        let deadline = tokio::time::Instant::now() + timeout;
+    ) -> impl Future<Output = Result<crate::http::HTTPResponse>> + Send + 'static {
+        let mut rx = self.network_tx.subscribe();
 
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Timeout("wait_for_response timed out".into()));
-            }
+        async move {
+            let deadline = tokio::time::Instant::now() + timeout;
 
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(event)) => {
-                    if event.session_id.as_deref() != Some(&session_id) {
-                        continue;
-                    }
-                    if event.method != "Network.responseReceived" {
-                        continue;
-                    }
-                    if let Some(resp) = crate::http::HTTPResponse::from_cdp_event(&event.params) {
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(Error::Timeout("wait_for_response timed out".into()));
+                }
+
+                match tokio::time::timeout(remaining, rx.recv()).await {
+                    Ok(Ok(NetworkEvent::Response(resp))) => {
                         if predicate(&resp) {
-                            return Ok(resp.with_target(self.target.clone()));
+                            return Ok(resp);
                         }
                     }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(_)) => return Err(Error::Connection("event channel closed".into())),
+                    Err(_) => return Err(Error::Timeout("wait_for_response timed out".into())),
                 }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(_)) => return Err(Error::Connection("event channel closed".into())),
-                Err(_) => return Err(Error::Timeout("wait_for_response timed out".into())),
             }
         }
     }
@@ -1366,18 +1416,18 @@ impl Page {
     // ── Metrics ─────────────────────────────────────────────────────
 
     /// Get a keyboard controller for this page.
-    pub fn keyboard(&self) -> crate::input::Keyboard {
-        crate::input::Keyboard::new(self.target.clone())
+    pub fn keyboard(&self) -> &Arc<Mutex<crate::input::Keyboard>> {
+        &self.keyboard
     }
 
     /// Get a mouse controller for this page.
-    pub fn mouse(&self) -> crate::input::Mouse {
-        crate::input::Mouse::new(self.target.clone())
+    pub fn mouse(&self) -> &Arc<Mutex<crate::input::Mouse>> {
+        &self.mouse
     }
 
     /// Get a touchscreen controller for this page.
-    pub fn touchscreen(&self) -> crate::input::Touchscreen {
-        crate::input::Touchscreen::new(self.target.clone())
+    pub fn touchscreen(&self) -> &Arc<Mutex<crate::input::Touchscreen>> {
+        &self.touchscreen
     }
 
     /// Retrieve current performance metrics.
@@ -1663,47 +1713,47 @@ impl Page {
 
     /// Wait for the next JavaScript dialog (alert/confirm/prompt/beforeunload).
     /// Returns a `Dialog` that must be accepted or dismissed.
-    pub async fn wait_for_dialog(&self) -> Result<Dialog> {
+    ///
+    /// The broadcast receiver is created synchronously at call time.
+    pub fn wait_for_dialog(&self) -> impl Future<Output = Result<Dialog>> + Send + 'static {
         let mut rx = self.target.event_receiver();
         let session_id = self.target.session_id.clone();
+        let target = self.target.clone();
 
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if event.session_id.as_deref() != Some(&session_id) {
-                        continue;
-                    }
-                    if event.method != "Page.javascriptDialogOpening" {
-                        continue;
-                    }
-                    let dialog_type = event
-                        .params
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .map(DialogType::from_cdp)
-                        .unwrap_or(DialogType::Alert);
-                    let message = event
-                        .params
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let default_value = event
-                        .params
-                        .get("defaultPrompt")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+        async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if event.session_id.as_deref() != Some(&session_id) {
+                            continue;
+                        }
+                        if event.method != "Page.javascriptDialogOpening" {
+                            continue;
+                        }
+                        let dialog_type = event
+                            .params
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .map(DialogType::from_cdp)
+                            .unwrap_or(DialogType::Alert);
+                        let message = event
+                            .params
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let default_value = event
+                            .params
+                            .get("defaultPrompt")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
 
-                    return Ok(Dialog::new(
-                        dialog_type,
-                        message,
-                        default_value,
-                        self.target.clone(),
-                    ));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err(Error::Connection("event channel closed".into()));
+                        return Ok(Dialog::new(dialog_type, message, default_value, target));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(Error::Connection("event channel closed".into()));
+                    }
                 }
             }
         }
@@ -1820,15 +1870,19 @@ impl Page {
     }
 
     /// Wait for a file chooser dialog with a custom timeout.
+    ///
+    /// The broadcast receiver is created before sending the CDP command,
+    /// so no events are missed.
     pub async fn wait_for_file_chooser_with_timeout(
         &self,
         timeout: Duration,
     ) -> Result<crate::file_chooser::FileChooser> {
+        let mut rx = self.target.event_receiver();
+        let session_id = self.target.session_id().to_owned();
+
         self.execute(SetInterceptFileChooserDialogParams::new(true))
             .await?;
 
-        let mut rx = self.target.event_receiver();
-        let session_id = self.target.session_id().to_owned();
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
@@ -1875,6 +1929,8 @@ impl Page {
         timeout: Duration,
         expect_new_document: Option<bool>,
     ) -> Result<LifecycleWatcher> {
+        let events = self.target.event_receiver();
+        let session_id = self.target.session_id().to_owned();
         let frames = self.frames().await?.clone();
         let main_frame_id = frames
             .main_frame()
@@ -1882,8 +1938,8 @@ impl Page {
             .ok_or_else(|| Error::Other("main frame not available".into()))?;
 
         Ok(LifecycleWatcher::new(
-            self.target.event_receiver(),
-            self.target.session_id().to_owned(),
+            events,
+            session_id,
             main_frame_id,
             frames,
             LifecycleWatchOptions {
@@ -2054,6 +2110,10 @@ fn expose_function_init_script(name: &str, binding_name: &str) -> String {
 /// Heuristic: detect if a JS string is likely a function.
 pub(crate) fn is_likely_js_function(s: &str) -> bool {
     let trimmed = s.trim();
+    if looks_like_iife(trimmed) {
+        return false;
+    }
+
     if let Some(stripped) = trimmed.strip_prefix("async ") {
         let rest = stripped.trim_start();
         if rest.starts_with("function") {
@@ -2072,6 +2132,14 @@ pub(crate) fn is_likely_js_function(s: &str) -> bool {
         return true;
     }
     false
+}
+
+fn looks_like_iife(s: &str) -> bool {
+    let compact: String = s.chars().filter(|ch| !ch.is_whitespace()).collect();
+    compact.starts_with("(()")
+        || compact.starts_with("(async(")
+        || compact.ends_with(")()")
+        || compact.ends_with(")();")
 }
 
 // ── Page event stream ────────────────────────────────────────────
@@ -2121,43 +2189,48 @@ impl Page {
     /// This is a convenience wrapper around
     /// [`event_stream()`](Self::event_stream) for one-shot console message
     /// capture.
-    pub async fn wait_for_console_message(
+    ///
+    /// The broadcast receiver is created synchronously at call time.
+    pub fn wait_for_console_message(
         &self,
-        predicate: impl Fn(&crate::events::ConsoleMessage) -> bool,
+        predicate: impl Fn(&crate::events::ConsoleMessage) -> bool + Send + 'static,
         timeout: std::time::Duration,
-    ) -> Result<crate::events::ConsoleMessage> {
+    ) -> impl Future<Output = Result<crate::events::ConsoleMessage>> + Send + 'static {
         let mut rx = self.target.event_receiver();
         let session_id = self.target.session_id.clone();
-        let deadline = tokio::time::Instant::now() + timeout;
 
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Timeout("wait_for_console_message timed out".into()));
-            }
+        async move {
+            let deadline = tokio::time::Instant::now() + timeout;
 
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(event)) => {
-                    if event.session_id.as_deref() != Some(&session_id) {
-                        continue;
-                    }
-                    if event.method != "Runtime.consoleAPICalled" {
-                        continue;
-                    }
-                    if let Some(crate::events::PageEvent::Console(msg)) =
-                        crate::events::convert_cdp_to_page_event(&event)
-                    {
-                        if predicate(&msg) {
-                            return Ok(msg);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(Error::Timeout("wait_for_console_message timed out".into()));
+                }
+
+                match tokio::time::timeout(remaining, rx.recv()).await {
+                    Ok(Ok(event)) => {
+                        if event.session_id.as_deref() != Some(&session_id) {
+                            continue;
+                        }
+                        if event.method != "Runtime.consoleAPICalled" {
+                            continue;
+                        }
+                        if let Some(crate::events::PageEvent::Console(msg)) =
+                            crate::events::convert_cdp_to_page_event(&event)
+                        {
+                            if predicate(&msg) {
+                                return Ok(msg);
+                            }
                         }
                     }
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(_)) => {
-                    return Err(Error::Connection("event channel closed".into()));
-                }
-                Err(_) => {
-                    return Err(Error::Timeout("wait_for_console_message timed out".into()));
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(_)) => {
+                        return Err(Error::Connection("event channel closed".into()));
+                    }
+                    Err(_) => {
+                        return Err(Error::Timeout("wait_for_console_message timed out".into()));
+                    }
                 }
             }
         }
@@ -2208,5 +2281,26 @@ where
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_likely_js_function, looks_like_iife};
+
+    #[test]
+    fn detects_function_declarations() {
+        assert!(is_likely_js_function("() => 1"));
+        assert!(is_likely_js_function("(a, b) => a + b"));
+        assert!(is_likely_js_function("async () => await foo()"));
+        assert!(is_likely_js_function("function () { return 1; }"));
+    }
+
+    #[test]
+    fn does_not_treat_iife_as_function_declaration() {
+        assert!(looks_like_iife("(() => { return 1; })()"));
+        assert!(looks_like_iife("(() => { return 1; })();"));
+        assert!(!is_likely_js_function("(() => { return 1; })()"));
+        assert!(!is_likely_js_function("(() => { return 1; })();"));
     }
 }

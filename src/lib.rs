@@ -45,6 +45,7 @@ pub mod http;
 pub(crate) mod injected;
 pub mod input;
 pub mod js_handle;
+pub mod keyboard_layout;
 pub(crate) mod lifecycle;
 pub mod locator;
 pub(crate) mod network;
@@ -77,7 +78,7 @@ pub use events::{ConsoleMessage, ConsoleMessageType, PageEvent};
 pub use file_chooser::FileChooser;
 pub use frame_handle::{AddTagOptions, FrameHandle};
 pub use http::{ContinueRequestOverrides, HTTPRequest, HTTPResponse, ResponseOverride};
-pub use input::{Keyboard, Mouse, Touchscreen};
+pub use input::{Keyboard, Mouse, MouseClickOptions, Touchscreen, TouchHandle};
 pub use js_handle::JSHandle;
 pub use locator::{
     FillOptions, FunctionLocator, LocatorOptions, NodeLocator, RaceLocator, RaceResult,

@@ -256,7 +256,7 @@ impl Element {
     pub async fn tap(&self) -> Result<&Self> {
         self.scroll_into_view().await?;
         let point = self.clickable_point().await?;
-        self.page.touchscreen().tap(point).await?;
+        self.page.touchscreen().lock().await.tap(point.x, point.y).await?;
         Ok(self)
     }
 
@@ -266,7 +266,12 @@ impl Element {
         let from = self.clickable_point().await?;
         target.scroll_into_view().await?;
         let to = target.clickable_point().await?;
-        self.page.mouse().drag(from, to).await
+        let mut mouse = self.page.mouse().lock().await;
+        mouse.move_to(from.x, from.y, None).await?;
+        mouse.down(None, None).await?;
+        mouse.move_to(to.x, to.y, Some(10)).await?;
+        mouse.up(None, None).await?;
+        Ok(())
     }
 
     // ── Properties & Attributes ─────────────────────────────────────

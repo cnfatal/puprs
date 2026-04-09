@@ -37,6 +37,7 @@ pub enum TargetType {
     Browser,
     Webview,
     Tab,
+    IFrame,
     Other,
 }
 
@@ -51,6 +52,7 @@ impl TargetType {
             "browser" => Self::Browser,
             "webview" => Self::Webview,
             "tab" => Self::Tab,
+            "iframe" => Self::IFrame,
             _ => Self::Other,
         }
     }
@@ -65,6 +67,7 @@ impl TargetType {
             Self::Browser => "browser",
             Self::Webview => "webview",
             Self::Tab => "tab",
+            Self::IFrame => "iframe",
             Self::Other => "other",
         }
     }
@@ -544,6 +547,23 @@ impl TargetManager {
                                 }
                             }
 
+                            // Establish parent-child relationship for OOP iframes.
+                            // The envelope session_id identifies the parent session.
+                            if let Some(parent_session) = &event.session_id {
+                                let parent_target_id =
+                                    session_to_target.read().await.get(parent_session).cloned();
+                                if let Some(ptid) = parent_target_id {
+                                    if let Some(parent_entry) = attached.read().await.get(&ptid) {
+                                        parent_entry
+                                            .target
+                                            .children
+                                            .write()
+                                            .await
+                                            .push(target_id.clone());
+                                    }
+                                }
+                            }
+
                             target.check_if_initialized().await;
                             let _ = event_tx.send(TargetEvent::TargetAvailable(target.clone()));
 
@@ -609,6 +629,23 @@ impl TargetManager {
                                 session_to_target.write().await.remove(&session_id);
 
                             if let Some(target_id) = maybe_target_id {
+                                // Remove from parent's children list
+                                if let Some(parent_session) = &event.session_id {
+                                    let parent_tid =
+                                        session_to_target.read().await.get(parent_session).cloned();
+                                    if let Some(ptid) = parent_tid {
+                                        if let Some(parent_entry) = attached.read().await.get(&ptid)
+                                        {
+                                            parent_entry
+                                                .target
+                                                .children
+                                                .write()
+                                                .await
+                                                .retain(|id| id != &target_id);
+                                        }
+                                    }
+                                }
+
                                 let maybe_target = attached
                                     .write()
                                     .await
@@ -664,6 +701,15 @@ impl TargetManager {
     /// Get the underlying transport.
     pub fn transport(&self) -> &Transport {
         &self.transport
+    }
+
+    /// Look up an attached target by its target ID.
+    pub async fn get_target(&self, target_id: &str) -> Option<Target> {
+        self.attached
+            .read()
+            .await
+            .get(target_id)
+            .map(|e| e.target.clone())
     }
 
     /// Return all page-type Page objects (pure memory read, zero CDP calls).

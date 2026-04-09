@@ -699,10 +699,16 @@ impl Browser {
     /// Wait for a target matching the predicate.
     ///
     /// Checks existing targets first, then listens for new events.
+    ///
+    /// The broadcast receiver is created before checking existing targets
+    /// to avoid missing events that arrive between the check and subscribe.
     pub async fn wait_for_target<F>(&self, predicate: F, timeout: Duration) -> Result<Target>
     where
         F: Fn(&Target) -> bool,
     {
+        // Subscribe first so we don't miss events between check and listen.
+        let mut rx = self.event_receiver();
+
         // Check existing targets
         for t in self.targets().await {
             if predicate(&t) {
@@ -711,7 +717,6 @@ impl Browser {
         }
 
         // Listen for new events
-        let mut rx = self.event_receiver();
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
