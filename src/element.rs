@@ -1,6 +1,7 @@
 use crate::cdp::browser_protocol::dom::{
     BackendNodeId, DescribeNodeParams, GetBoxModelParams, GetContentQuadsParams, Node, NodeId,
-    QuerySelectorAllParams, QuerySelectorParams, ResolveNodeParams, SetFileInputFilesParams,
+    QuerySelectorAllParams, QuerySelectorParams, ResolveNodeParams, ScrollIntoViewIfNeededParams,
+    SetFileInputFilesParams,
 };
 use crate::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use crate::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams, RemoteObjectId};
@@ -121,7 +122,7 @@ impl Element {
 
     /// Click the element.
     pub async fn click(&self) -> Result<&Self> {
-        self.scroll_into_view().await?;
+        self.scroll_into_view_if_needed().await?;
         let point = self.clickable_point().await?;
         self.page.click(point).await?;
         Ok(self)
@@ -129,7 +130,7 @@ impl Element {
 
     /// Click the element with options (button, count, delay, offset).
     pub async fn click_with(&self, options: ClickOptions) -> Result<&Self> {
-        self.scroll_into_view().await?;
+        self.scroll_into_view_if_needed().await?;
         let point = self.clickable_point().await?;
         self.page.click_with(point, options).await?;
         Ok(self)
@@ -144,46 +145,107 @@ impl Element {
 
     /// Hover over the element.
     pub async fn hover(&self) -> Result<&Self> {
-        self.scroll_into_view().await?;
+        self.scroll_into_view_if_needed().await?;
         let point = self.clickable_point().await?;
         self.page.move_mouse(point).await?;
         Ok(self)
     }
 
-    /// Scroll the element into view.
-    pub async fn scroll_into_view(&self) -> Result<&Self> {
-        let resp = self
+    /// Assert that the element is connected to the DOM and is an element node.
+    async fn assert_connected_element(&self) -> Result<()> {
+        let result = self
             .call_js_fn(
-                r#"async function() {
+                r#"function() {
                     if (!this.isConnected)
                         return 'Node is detached from document';
                     if (this.nodeType !== Node.ELEMENT_NODE)
                         return 'Node is not of type HTMLElement';
-
-                    const visibleRatio = await new Promise(resolve => {
-                        const observer = new IntersectionObserver(entries => {
-                            resolve(entries[0].intersectionRatio);
-                            observer.disconnect();
-                        });
-                        observer.observe(this);
-                    });
-
-                    if (visibleRatio !== 1.0)
-                        this.scrollIntoView({
-                            block: 'center',
-                            inline: 'center',
-                            behavior: 'instant'
-                        });
                     return false;
                 }"#,
+                false,
+            )
+            .await?;
+        if let Some(serde_json::Value::String(err)) = result.value() {
+            return Err(Error::Other(err.clone()));
+        }
+        Ok(())
+    }
+
+    /// Check whether the element intersects the viewport.
+    ///
+    /// `threshold` ranges from 0.0 (any pixel visible) to 1.0 (fully visible).
+    /// When `threshold` is 1.0 the function returns `true` only if the element
+    /// is *completely* inside the viewport.
+    pub async fn is_intersecting_viewport(&self, threshold: f64) -> Result<bool> {
+        let result = self
+            .call_js_fn(
+                &format!(
+                    r#"async function() {{
+                        const visibleRatio = await new Promise(resolve => {{
+                            const observer = new IntersectionObserver(entries => {{
+                                resolve(entries[0].intersectionRatio);
+                                observer.disconnect();
+                            }});
+                            observer.observe(this);
+                        }});
+                        if ({threshold} === 1) {{
+                            return visibleRatio === 1;
+                        }} else {{
+                            return visibleRatio > {threshold};
+                        }}
+                    }}"#
+                ),
                 true,
             )
             .await?;
+        Ok(result.into_value::<bool>().unwrap_or(false))
+    }
 
-        // If result is a string, it's an error message
-        if let Some(serde_json::Value::String(err)) = resp.value() {
-            return Err(Error::Other(format!("scroll_into_view failed: {err}")));
+    /// Scroll the element into view only if it is not already fully visible.
+    ///
+    /// This is the method used internally by [`click`](Self::click),
+    /// [`hover`](Self::hover), etc. — matching Puppeteer's
+    /// `scrollIntoViewIfNeeded` behaviour.
+    pub async fn scroll_into_view_if_needed(&self) -> Result<&Self> {
+        if self.is_intersecting_viewport(1.0).await? {
+            return Ok(self);
         }
+        self.scroll_into_view().await
+    }
+
+    /// Scroll the element into view (always scrolls).
+    ///
+    /// Uses the CDP `DOM.scrollIntoViewIfNeeded` command when available
+    /// (more reliable for cross-origin iframes), falling back to a JS
+    /// `element.scrollIntoView()` call (aligned with Puppeteer).
+    pub async fn scroll_into_view(&self) -> Result<&Self> {
+        self.assert_connected_element().await?;
+
+        // Try CDP DOM.scrollIntoViewIfNeeded first.
+        let cdp_result = self
+            .page
+            .execute(
+                ScrollIntoViewIfNeededParams::builder()
+                    .object_id(self.remote_object_id.clone())
+                    .build(),
+            )
+            .await;
+
+        if cdp_result.is_err() {
+            // Fallback to JS element.scrollIntoView (aligned with Puppeteer).
+            self.call_js_fn(
+                r#"function() {
+                    this.scrollIntoView({
+                        block: 'center',
+                        inline: 'center',
+                        behavior: 'instant'
+                    });
+                }"#,
+                false,
+            )
+            .await?;
+        }
+
         Ok(self)
     }
 
@@ -254,17 +316,22 @@ impl Element {
 
     /// Tap the element (touch input).
     pub async fn tap(&self) -> Result<&Self> {
-        self.scroll_into_view().await?;
+        self.scroll_into_view_if_needed().await?;
         let point = self.clickable_point().await?;
-        self.page.touchscreen().lock().await.tap(point.x, point.y).await?;
+        self.page
+            .touchscreen()
+            .lock()
+            .await
+            .tap(point.x, point.y)
+            .await?;
         Ok(self)
     }
 
     /// Drag this element to the target element.
     pub async fn drag_to(&self, target: &Element) -> Result<()> {
-        self.scroll_into_view().await?;
+        self.scroll_into_view_if_needed().await?;
         let from = self.clickable_point().await?;
-        target.scroll_into_view().await?;
+        target.scroll_into_view_if_needed().await?;
         let to = target.clickable_point().await?;
         let mut mouse = self.page.mouse().lock().await;
         mouse.move_to(from.x, from.y, None).await?;
@@ -521,7 +588,7 @@ impl Element {
 
     async fn element_screenshot(&self, format: CaptureScreenshotFormat) -> Result<Vec<u8>> {
         use crate::cdp::browser_protocol::page::{CaptureScreenshotParams, Viewport};
-        self.scroll_into_view().await?;
+        self.scroll_into_view_if_needed().await?;
         let bb = self.bounding_box().await?;
         let params = CaptureScreenshotParams {
             format: Some(format),

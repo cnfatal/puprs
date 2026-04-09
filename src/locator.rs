@@ -803,14 +803,14 @@ async fn wait_for_visibility(
 
 /// Scroll the element into the viewport, then verify it's actually intersecting.
 async fn ensure_in_viewport(element: &Element, deadline: tokio::time::Instant) -> Result<()> {
-    if is_intersecting_viewport(element).await? {
+    if element.is_intersecting_viewport(0.0).await? {
         return Ok(());
     }
 
     element.scroll_into_view().await?;
 
     loop {
-        if is_intersecting_viewport(element).await? {
+        if element.is_intersecting_viewport(0.0).await? {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -820,26 +820,6 @@ async fn ensure_in_viewport(element: &Element, deadline: tokio::time::Instant) -
         }
         tokio::time::sleep(RETRY_DELAY).await;
     }
-}
-
-/// Check if element intersects the viewport.
-async fn is_intersecting_viewport(element: &Element) -> Result<bool> {
-    let val: bool = element
-        .call_js_fn_arg(
-            r#"(el) => {
-                const rect = el.getBoundingClientRect();
-                return rect.top < window.innerHeight
-                    && rect.bottom > 0
-                    && rect.left < window.innerWidth
-                    && rect.right > 0;
-            }"#,
-            false,
-        )
-        .await
-        .ok()
-        .and_then(|r| r.into_value::<bool>().ok())
-        .unwrap_or(false);
-    Ok(val)
 }
 
 /// Wait for a stable bounding box across two animation frames, with retry.
