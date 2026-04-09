@@ -9,7 +9,7 @@
 //! `TargetManager`).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use indexmap::IndexMap;
 use tokio::sync::{RwLock, broadcast};
@@ -136,6 +136,9 @@ pub struct Target {
     pub(crate) init_notify: Arc<tokio::sync::Notify>,
     /// Child target IDs (OOP iframes).
     pub(crate) children: Arc<RwLock<Vec<String>>>,
+    /// Weak reference to TargetManager's attached targets map (for opener lookup).
+    /// Uses Weak to avoid Arc reference cycles.
+    pub(crate) attached_targets: Weak<RwLock<IndexMap<String, AttachedTarget>>>,
 }
 
 impl Target {
@@ -145,6 +148,7 @@ impl Target {
         session_id: String,
         target_id: String,
         info: Arc<RwLock<TargetInfo>>,
+        attached_targets: Weak<RwLock<IndexMap<String, AttachedTarget>>>,
     ) -> Self {
         Self {
             transport,
@@ -154,6 +158,7 @@ impl Target {
             init_status: Arc::new(RwLock::new(InitStatus::Pending)),
             init_notify: Arc::new(tokio::sync::Notify::new()),
             children: Arc::new(RwLock::new(Vec::new())),
+            attached_targets,
         }
     }
 
@@ -174,6 +179,7 @@ impl Target {
             session_id,
             target_id,
             Arc::new(RwLock::new(info)),
+            Weak::new(),
         )
     }
 
@@ -240,6 +246,17 @@ impl Target {
             }
             self.init_notify.notified().await;
         }
+    }
+
+    /// Return the opener target (the target that opened this one), if any.
+    ///
+    /// Aligned with Puppeteer's `Target.opener()`. For example, a popup
+    /// page will have the page that called `window.open()` as its opener.
+    pub async fn opener(&self) -> Option<Target> {
+        let opener_id = self.info.read().await.opener_id.clone()?;
+        let attached = self.attached_targets.upgrade()?;
+        let map = attached.read().await;
+        map.get(&opener_id).map(|e| e.target.clone())
     }
 
     // ── Internal lifecycle methods ──────────────────────────────────
@@ -349,7 +366,6 @@ impl TargetManager {
     }
 
     /// Return all exposed and initialized targets.
-    #[allow(dead_code)]
     pub async fn exposed_targets(&self) -> Vec<Target> {
         let map = self.attached.read().await;
         let mut targets = Vec::new();
@@ -524,6 +540,7 @@ impl TargetManager {
                                 session_id.clone(),
                                 target_id.clone(),
                                 Arc::clone(&shared_info),
+                                Arc::downgrade(&attached),
                             );
 
                             // Insert into maps
@@ -733,7 +750,6 @@ impl TargetManager {
     }
 
     /// Return all discovered targets metadata (lightweight, no Page creation).
-    #[allow(dead_code)]
     pub async fn discovered_targets(&self) -> Vec<TargetInfo> {
         self.discovered.read().await.values().cloned().collect()
     }

@@ -685,6 +685,19 @@ impl Browser {
         self.inner.target_manager.exposed_targets().await
     }
 
+    /// Look up a target by its target ID.
+    pub async fn target_by_id(&self, target_id: &str) -> Option<Target> {
+        self.inner.target_manager.get_target(target_id).await
+    }
+
+    /// Return metadata for all discovered targets (including those not yet attached).
+    ///
+    /// Useful for diagnostics. Unlike [`targets()`](Self::targets), this returns
+    /// lightweight [`TargetInfo`] without requiring attachment or initialization.
+    pub async fn discovered_targets(&self) -> Vec<crate::target::TargetInfo> {
+        self.inner.target_manager.discovered_targets().await
+    }
+
     /// Get the browser's own target.
     pub async fn target(&self) -> Option<Target> {
         let all = self.inner.target_manager.exposed_targets().await;
