@@ -78,7 +78,7 @@ pub use events::{ConsoleMessage, ConsoleMessageType, PageEvent};
 pub use file_chooser::FileChooser;
 pub use frame_handle::{AddTagOptions, FrameHandle};
 pub use http::{ContinueRequestOverrides, HTTPRequest, HTTPResponse, ResponseOverride};
-pub use input::{Keyboard, Mouse, MouseClickOptions, Touchscreen, TouchHandle};
+pub use input::{Keyboard, Mouse, MouseClickOptions, TouchHandle, Touchscreen};
 pub use js_handle::JSHandle;
 pub use locator::{
     FillOptions, FunctionLocator, LocatorOptions, NodeLocator, RaceLocator, RaceResult,
