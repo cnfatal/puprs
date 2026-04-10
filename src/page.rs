@@ -459,6 +459,7 @@ impl Page {
         let NavigateOptions {
             url,
             referrer,
+            referrer_policy,
             timeout,
             wait_until,
         } = options;
@@ -478,6 +479,9 @@ impl Page {
         let mut params = NavigateParams::new(url);
         if let Some(referrer) = referrer {
             params.referrer = Some(referrer);
+        }
+        if let Some(referrer_policy) = referrer_policy {
+            params.referrer_policy = Some(referrer_policy);
         }
         let resp = self.execute(params).await?;
 

@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::cdp::browser_protocol::input::MouseButton;
+use crate::cdp::browser_protocol::page::ReferrerPolicy;
 use crate::cdp::js_protocol::runtime::{RemoteObject, RemoteObjectType};
 
 /// A 2D point.
@@ -98,6 +99,7 @@ pub enum WaitUntil {
 pub struct NavigateOptions {
     pub url: String,
     pub referrer: Option<String>,
+    pub referrer_policy: Option<ReferrerPolicy>,
     pub timeout: Option<Duration>,
     pub wait_until: Vec<WaitUntil>,
 }
@@ -107,6 +109,7 @@ impl Default for NavigateOptions {
         Self {
             url: String::new(),
             referrer: None,
+            referrer_policy: None,
             timeout: None,
             wait_until: vec![WaitUntil::Load],
         }
@@ -134,6 +137,7 @@ impl NavigateOptions {
         Self {
             url: url.into(),
             referrer: None,
+            referrer_policy: None,
             timeout: None,
             wait_until: vec![WaitUntil::Load],
         }
