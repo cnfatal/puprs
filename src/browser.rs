@@ -68,10 +68,16 @@ impl BrowserProcess {
         temp_user_data_dir: Option<PathBuf>,
         timeout: Duration,
     ) -> Result<Self> {
-        let mut child = Command::new(&executable)
-            .args(&args)
+        let mut cmd = Command::new(&executable);
+        cmd.args(&args)
             .stderr(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+
+        // Make Chrome its own process group so we can kill the group on shutdown.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| Error::Launch(format!("failed to spawn: {e}")))?;
 
@@ -98,10 +104,72 @@ impl BrowserProcess {
         })
     }
 
-    /// Wait for the child process to exit, then clean up temp resources.
-    async fn shutdown(&mut self) {
-        let _ = self.child.wait().await;
+    /// Shut down the browser process gracefully.
+    ///
+    /// 1. Wait briefly for the process to exit on its own (CDP `Browser.close`
+    ///    may have already triggered shutdown).
+    /// 2. If still alive, send SIGTERM (Unix) to the process group for a
+    ///    graceful exit (Chrome flushes caches, saves sessions, etc.).
+    /// 3. If still alive after `timeout`, SIGKILL the process group.
+    async fn shutdown_with_timeout(&mut self, timeout: Duration) {
+        // Quick check: process may already be exiting from Browser.close.
+        match tokio::time::timeout(Duration::from_millis(500), self.child.wait()).await {
+            Ok(_) => {
+                self.cleanup().await;
+                return;
+            }
+            Err(_) => {}
+        }
+
+        // Send SIGTERM for graceful shutdown.
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+        }
+
+        // Wait for graceful exit within remaining timeout.
+        let remaining = timeout.saturating_sub(Duration::from_millis(500));
+        match tokio::time::timeout(remaining, self.child.wait()).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(
+                    "process did not exit within {}s, sending SIGKILL",
+                    timeout.as_secs()
+                );
+                self.force_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
+            }
+        }
         self.cleanup().await;
+    }
+
+    /// Kill the browser process tree.  On Unix we kill the process group
+    /// (like Puppeteer's `kill(-pid, SIGKILL)`) so that GPU/renderer
+    /// sub-processes are cleaned up too.
+    fn force_kill(&self) {
+        if let Some(pid) = self.child.id() {
+            #[cfg(unix)]
+            {
+                // Kill the entire process group
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
+                // On non-Unix, fall back to killing just the main process.
+                // std::process::Command::new("taskkill")
+                //     .args(["/pid", &pid.to_string(), "/T", "/F"])
+                //     .output();
+                // For now, use the tokio kill method (sync version via std).
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/pid", &pid.to_string(), "/T", "/F"])
+                    .output();
+            }
+        }
     }
 
     async fn cleanup(&self) {
@@ -550,41 +618,42 @@ impl Browser {
         &self.inner.debug_ws_url
     }
 
-    /// Close the browser gracefully and clean up all resources.
+    /// Close the browser and clean up all resources.
     ///
-    /// - `launch()` mode: sends CDP `Browser.close`, shuts down transport, kills process.
-    /// - `connect()` mode: only disconnects (does not affect the browser process).
+    /// Follows Puppeteer's exact sequence:
+    /// 1. Send `Browser.close` CDP command (tell Chrome to shut down)
+    /// 2. Wait for the process to exit (5 s timeout, then kill)
+    /// 3. Disconnect transport
+    ///
+    /// The transport stays alive while Chrome shuts down so it can
+    /// finish any internal CDP housekeeping (e.g. `runIfWaitingForDebugger`).
+    ///
+    /// - `connect()` mode: only disconnects (browser process keeps running).
     pub async fn close(&self) {
-        if self.inner.is_connected {
-            self.disconnect().await;
-            return;
-        }
-
-        let transport = self.inner.target_manager.transport();
-
-        // Try graceful CDP close, ignore errors
-        let _ = transport.send_command(CloseParams::default(), None).await;
-        transport.shutdown();
-
-        if let Some(h) = self.inner.transport_handle.lock().await.take() {
-            let _ = h.await;
+        if !self.inner.is_connected {
+            let transport = self.inner.target_manager.transport();
+            let _ = transport.send_command(CloseParams::default(), None).await;
         }
 
         if let Some(mut process) = self.inner.process.lock().await.take() {
-            process.shutdown().await;
+            process
+                .shutdown_with_timeout(std::time::Duration::from_secs(5))
+                .await;
         }
 
-        self.inner.disconnected.notify_waiters();
-        let _ = self.inner.browser_event_tx.send(BrowserEvent::Disconnected);
+        self.disconnect().await;
     }
 
     /// Disconnect the WebSocket connection without closing the browser process.
+    ///
+    /// Shuts down the transport (rejecting all pending CDP commands),
+    /// waits for the background loop to exit, and notifies listeners.
     pub async fn disconnect(&self) {
         let transport = self.inner.target_manager.transport();
         transport.shutdown();
 
         if let Some(h) = self.inner.transport_handle.lock().await.take() {
-            let _ = h.await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
         }
 
         self.inner.disconnected.notify_waiters();
@@ -752,13 +821,6 @@ impl Browser {
                 }
             }
         }
-    }
-}
-
-impl Drop for Browser {
-    fn drop(&mut self) {
-        self.inner.target_manager.transport().shutdown();
-        // BrowserProcess::Drop handles child kill + temp dir cleanup
     }
 }
 

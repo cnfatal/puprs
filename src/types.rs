@@ -42,7 +42,7 @@ impl Default for ClickOptions {
 }
 
 /// Axis-aligned bounding box.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 pub struct BoundingBox {
     pub x: f64,
     pub y: f64,

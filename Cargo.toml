@@ -37,6 +37,9 @@ which = "8"
 tracing = "0.1"
 dunce = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"
 

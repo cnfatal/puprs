@@ -208,9 +208,20 @@ impl Target {
         Ok(())
     }
 
-    /// Subscribe to raw CDP events for this target's session.
+    /// Subscribe to CDP events scoped to this target's session.
+    ///
+    /// The channel closes automatically when the session is detached,
+    /// causing background listeners to exit cleanly.
     pub fn event_receiver(&self) -> tokio::sync::broadcast::Receiver<CdpEvent> {
-        self.transport.event_receiver()
+        self.transport
+            .session_receiver(&self.session_id)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    "session_receiver: session not registered, returning global fallback"
+                );
+                self.transport.event_receiver()
+            })
     }
 
     // ── Query methods (read from shared info) ───────────────────────

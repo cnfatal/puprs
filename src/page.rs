@@ -148,6 +148,8 @@ impl Page {
     }
 
     /// Spawn a background task that feeds CDP events into the NetworkManager.
+    ///
+    /// Exits automatically when the session channel closes (page closed/detached).
     fn start_network_manager(&self) {
         let network = Arc::clone(&self.network);
         let mut events = self.target.event_receiver();
@@ -172,17 +174,17 @@ impl Page {
     /// frame-level events from the iframe's own session are tracked.
     fn start_oop_iframe_listener(&self) {
         let mut events = self.target.event_receiver();
-        let page_session_id = self.target.session_id.clone();
         let transport = self.target.transport.clone();
         let frames = Arc::clone(&self.frames);
 
         tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                // Only process attachedToTarget events addressed to this page's session.
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
                 if event.method != "Target.attachedToTarget" {
-                    continue;
-                }
-                if event.session_id.as_deref() != Some(&page_session_id) {
                     continue;
                 }
 
@@ -408,8 +410,7 @@ impl Page {
         predicate: impl Fn(&HTTPRequest) -> bool + Send + 'static,
         timeout: Duration,
     ) -> impl Future<Output = Result<HTTPRequest>> + Send + 'static {
-        let mut events = self.target.transport.event_receiver();
-        let session_id = self.target.session_id.clone();
+        let mut events = self.target.event_receiver();
         let target = self.target.clone();
 
         async move {
@@ -430,9 +431,6 @@ impl Page {
                     })?
                     .map_err(|e| Error::Other(e.to_string()))?;
 
-                if event.session_id.as_deref() != Some(&session_id) {
-                    continue;
-                }
                 if event.method != "Fetch.requestPaused" {
                     continue;
                 }
@@ -590,6 +588,8 @@ impl Page {
         // Page.close triggers beforeunload handlers.
         let _ = self.execute(PageCloseParams::default()).await;
         // Target.closeTarget removes the target from the browser.
+        // This triggers Target.detachedFromTarget in the transport, which
+        // drops the session's broadcast sender → all background tasks exit.
         self.target.close().await?;
         Ok(())
     }
@@ -1364,7 +1364,7 @@ impl Page {
         // Store credentials and listen for auth challenges
         let transport = self.target.transport.clone();
         let session_id = self.target.session_id.clone();
-        let mut events = transport.event_receiver();
+        let mut events = self.target.event_receiver();
 
         tokio::spawn(async move {
             use crate::cdp::browser_protocol::fetch::{
@@ -1373,10 +1373,6 @@ impl Page {
             };
 
             while let Ok(event) = events.recv().await {
-                if event.session_id.as_deref() != Some(&session_id) {
-                    continue;
-                }
-
                 match event.method.as_str() {
                     "Fetch.authRequired" => {
                         let Ok(auth) =
@@ -1833,9 +1829,34 @@ impl Page {
 
         let args = vec![serde_json::json!(resolved.selector), visible_arg];
 
-        crate::wait::run_wait_task(self, &predicate, &args, &polling, timeout).await?;
+        // Use the handle-returning variant so we can construct Element directly
+        // from the JS result, avoiding a re-query race with SPA re-renders.
+        let (object_id, _eval) =
+            crate::wait::run_wait_task_for_handle(self, &predicate, &args, &polling, timeout)
+                .await?;
 
-        // Rebuild full selector for find_element
+        // If the wait task returned a live handle (DOM node), construct Element
+        // directly — no re-query needed.
+        if let Some(oid) = object_id {
+            match self
+                .execute(DescribeNodeParams::builder().object_id(oid.clone()).build())
+                .await
+            {
+                Ok(describe) => {
+                    return Ok(Some(Element {
+                        remote_object_id: oid,
+                        backend_node_id: describe.node.backend_node_id,
+                        node_id: describe.node.node_id,
+                        page: self.clone(),
+                    }));
+                }
+                Err(_) => {
+                    // Handle might already be stale — fall through to find_element.
+                }
+            }
+        }
+
+        // Fallback: re-query (for hidden-wait or when the predicate returned a primitive).
         let full_selector = if resolved.name == "css" {
             resolved.selector.clone()
         } else {

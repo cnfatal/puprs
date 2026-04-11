@@ -3,11 +3,11 @@
 //! Provides a background task that:
 //! - Sends CDP commands over WebSocket
 //! - Receives responses and routes them to waiting callers via oneshot channels
-//! - Receives events and broadcasts them to registered listeners
+//! - Routes events to per-session broadcast channels (session-scoped dispatch)
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use fnv::FnvHashMap;
 use futures::StreamExt;
@@ -52,7 +52,10 @@ pub struct CdpEvent {
 #[derive(Clone)]
 pub(crate) struct Transport {
     tx: mpsc::UnboundedSender<TransportMessage>,
-    event_tx: broadcast::Sender<CdpEvent>,
+    /// Broadcast for browser-level events (Target.*, events without session_id).
+    global_tx: broadcast::Sender<CdpEvent>,
+    /// Per-session broadcast channels. Sender drops when session is removed → receivers close.
+    sessions: Arc<StdRwLock<HashMap<String, broadcast::Sender<CdpEvent>>>>,
     /// Notified when the WebSocket connection closes.
     closed: Arc<Notify>,
 }
@@ -78,18 +81,21 @@ impl Transport {
                 .map_err(|e| Error::Connection(format!("WebSocket connect failed: {e}")))?;
 
         let (msg_tx, msg_rx) = mpsc::unbounded();
-        let (event_tx, _event_rx) = broadcast::channel(256);
+        let (global_tx, _) = broadcast::channel(256);
+        let sessions: Arc<StdRwLock<HashMap<String, broadcast::Sender<CdpEvent>>>> =
+            Arc::new(StdRwLock::new(HashMap::new()));
         let closed = Arc::new(Notify::new());
         let closed_clone = closed.clone();
 
         let transport = Transport {
             tx: msg_tx,
-            event_tx: event_tx.clone(),
+            global_tx: global_tx.clone(),
+            sessions: sessions.clone(),
             closed,
         };
 
         let handle = tokio::spawn(async move {
-            transport_loop(ws, msg_rx, event_tx).await;
+            transport_loop(ws, msg_rx, global_tx, sessions).await;
             closed_clone.notify_waiters();
         });
 
@@ -135,9 +141,21 @@ impl Transport {
         serde_json::from_value(result).map_err(Error::from)
     }
 
-    /// Subscribe to raw CDP events.
+    /// Subscribe to global (browser-level) CDP events.
+    ///
+    /// Only receives events without a session_id plus all `Target.*` events.
+    /// For session-scoped events, use [`session_receiver`](Self::session_receiver).
     pub fn event_receiver(&self) -> broadcast::Receiver<CdpEvent> {
-        self.event_tx.subscribe()
+        self.global_tx.subscribe()
+    }
+
+    /// Subscribe to events for a specific session.
+    ///
+    /// Returns `None` if the session is not (yet) registered. The channel
+    /// closes automatically when the session is detached.
+    pub fn session_receiver(&self, session_id: &str) -> Option<broadcast::Receiver<CdpEvent>> {
+        let sessions = self.sessions.read().unwrap();
+        sessions.get(session_id).map(|tx| tx.subscribe())
     }
 
     /// Send shutdown signal.
@@ -160,7 +178,8 @@ impl Transport {
 async fn transport_loop(
     ws: async_tungstenite::WebSocketStream<async_tungstenite::tokio::ConnectStream>,
     mut msg_rx: mpsc::UnboundedReceiver<TransportMessage>,
-    event_tx: broadcast::Sender<CdpEvent>,
+    global_tx: broadcast::Sender<CdpEvent>,
+    sessions: Arc<StdRwLock<HashMap<String, broadcast::Sender<CdpEvent>>>>,
 ) {
     let (mut ws_sink, mut ws_stream) = ws.split();
 
@@ -195,8 +214,6 @@ async fn transport_loop(
                         }
                     }
                     Some(TransportMessage::Shutdown) | None => {
-                        // Close WebSocket and exit
-                        let _ = ws_sink.close(None).await;
                         break;
                     }
                 }
@@ -212,17 +229,53 @@ async fn transport_loop(
                                 let _ = sender.send(Ok(resp));
                             }
                         } else if let Ok(event) = serde_json::from_str::<RawEvent>(text.as_str()) {
-                            let _ = event_tx.send(CdpEvent {
+                            let cdp_event = CdpEvent {
                                 method: event.method,
                                 session_id: event.session_id,
                                 params: event.params,
-                            });
+                            };
+
+                            // Auto-manage per-session channels on attach/detach.
+                            if cdp_event.method == "Target.attachedToTarget" {
+                                if let Some(new_sid) =
+                                    cdp_event.params.get("sessionId").and_then(|s| s.as_str())
+                                {
+                                    let (tx, _) = broadcast::channel(256);
+                                    sessions.write().unwrap().insert(new_sid.to_owned(), tx);
+                                }
+                            } else if cdp_event.method == "Target.detachedFromTarget" {
+                                if let Some(sid) =
+                                    cdp_event.params.get("sessionId").and_then(|s| s.as_str())
+                                {
+                                    // Dropping the sender closes all receivers.
+                                    sessions.write().unwrap().remove(sid);
+                                }
+                            }
+
+                            // Route to session channel if the event has a session_id.
+                            if let Some(ref sid) = cdp_event.session_id {
+                                let sessions = sessions.read().unwrap();
+                                if let Some(tx) = sessions.get(sid) {
+                                    let _ = tx.send(cdp_event.clone());
+                                }
+                            }
+
+                            // Route to global for: events without session_id, or
+                            // Target.* events (TargetManager needs these regardless
+                            // of session_id).
+                            if cdp_event.session_id.is_none()
+                                || cdp_event.method.starts_with("Target.")
+                            {
+                                let _ = global_tx.send(cdp_event);
+                            }
                         } else {
                             tracing::debug!("Unrecognized WS message: {}", text.as_str());
                         }
                     }
-                    Some(Ok(WsMessage::Close(_))) | None => {
-                        // WebSocket closed
+                    Some(Ok(WsMessage::Close(_))) => {
+                        break;
+                    }
+                    None => {
                         break;
                     }
                     Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {
@@ -232,7 +285,7 @@ async fn transport_loop(
                         tracing::debug!("Unexpected WS message type: {:?}", msg);
                     }
                     Some(Err(e)) => {
-                        tracing::error!("WebSocket error: {e}");
+                        tracing::debug!("WebSocket error: {e}");
                         break;
                     }
                 }
@@ -251,6 +304,17 @@ async fn transport_loop(
     // Clean up pending commands
     for (_, sender) in pending.drain() {
         let _ = sender.send(Err(Error::Connection("transport closed".into())));
+    }
+
+    // Also drain any commands still buffered in the channel (race: they
+    // arrived after the last select! iteration but before we exited).
+    msg_rx.close();
+    while let Some(msg) = msg_rx.next().await {
+        if let TransportMessage::Command(cmd) = msg {
+            let _ = cmd
+                .sender
+                .send(Err(Error::Connection("transport closed".into())));
+        }
     }
 }
 

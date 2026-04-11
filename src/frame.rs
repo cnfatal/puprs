@@ -102,6 +102,9 @@ impl FrameManager {
     /// - Enable lifecycle events.
     /// - Fetch the current frame tree.
     /// - Spawn a background event-listener task.
+    ///
+    /// The background task exits automatically when the session's broadcast
+    /// channel closes (i.e. when the page/target is detached).
     pub(crate) async fn start(target: &Target) -> Result<Self> {
         // Enable lifecycle events
         target
@@ -129,7 +132,12 @@ impl FrameManager {
         let mut events = target.event_receiver();
         let sid = target.session_id().to_owned();
         tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break, // Channel closed (session detached)
+                };
                 // Only process events for our session
                 if event.session_id.as_deref() != Some(&sid) {
                     continue;
@@ -401,6 +409,39 @@ impl FrameManager {
     ) -> bool {
         let s = self.state.read().await;
         check_lifecycle_recursive(&s, frame_id, event_name)
+    }
+
+    /// Return a snapshot of all frames' lifecycle state for LifecycleWatcher seeding.
+    ///
+    /// Each entry maps `frame_id_string` → (lifecycle_events, has_started_loading, children).
+    pub async fn lifecycle_snapshot(
+        &self,
+    ) -> std::collections::HashMap<
+        String,
+        (
+            std::collections::HashSet<String>,
+            bool,
+            std::collections::HashSet<String>,
+        ),
+    > {
+        let s = self.state.read().await;
+        s.frames
+            .iter()
+            .map(|(id, frame)| {
+                (
+                    id.as_ref().to_owned(),
+                    (
+                        frame.lifecycle_events.clone(),
+                        frame.has_started_loading,
+                        frame
+                            .child_frames
+                            .iter()
+                            .map(|c| c.as_ref().to_owned())
+                            .collect(),
+                    ),
+                )
+            })
+            .collect()
     }
 }
 

@@ -1,9 +1,10 @@
 use std::time::Duration;
 
-use crate::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
+use crate::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams, RemoteObjectId};
 use crate::error::{Error, Result};
 use crate::injected::INJECTED_SOURCE;
 use crate::page::Page;
+use crate::types::EvaluationResult;
 
 /// Polling strategy for [`WaitForFunctionOptions`].
 #[derive(Debug, Clone, Default)]
@@ -93,6 +94,35 @@ fn is_context_destroyed_error(err: &Error) -> bool {
         || msg.contains("Inspected target navigated or closed")
 }
 
+/// Like [`run_wait_task`] but returns a live handle (`RemoteObjectId`) when the
+/// predicate returns a DOM node.  Uses `return_by_value(false)` so the
+/// JS runtime keeps the reference alive until we use it.
+pub(crate) async fn run_wait_task_for_handle(
+    page: &Page,
+    predicate_body: &str,
+    args_json: &[serde_json::Value],
+    polling: &PollingStrategy,
+    timeout: Duration,
+) -> Result<(Option<RemoteObjectId>, EvaluationResult)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Timeout("wait task timed out".into()));
+        }
+
+        match run_wait_task_once_handle(page, predicate_body, args_json, polling, remaining).await {
+            Ok(val) => return Ok(val),
+            Err(e) if is_context_destroyed_error(&e) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 async fn run_wait_task_once(
     page: &Page,
     predicate_body: &str,
@@ -155,4 +185,70 @@ async fn run_wait_task_once(
         .map_err(|_| Error::Timeout("wait task timed out".into()))??;
 
     Ok(result.value().cloned().unwrap_or(serde_json::Value::Null))
+}
+
+/// Same as [`run_wait_task_once`] but returns a handle (uses `return_by_value(false)`).
+async fn run_wait_task_once_handle(
+    page: &Page,
+    predicate_body: &str,
+    args_json: &[serde_json::Value],
+    polling: &PollingStrategy,
+    remaining: Duration,
+) -> Result<(Option<RemoteObjectId>, EvaluationResult)> {
+    let poller_ctor = match polling {
+        PollingStrategy::Mutation => {
+            "new util.MutationPoller(() => predicateFn(util, ...args), document)".to_string()
+        }
+        PollingStrategy::Raf => "new util.RAFPoller(() => predicateFn(util, ...args))".to_string(),
+        PollingStrategy::Interval(d) => {
+            format!(
+                "new util.IntervalPoller(() => predicateFn(util, ...args), {})",
+                d.as_millis()
+            )
+        }
+    };
+
+    let js = format!(
+        r#"async function(predicateStr, ...args) {{
+            if (!globalThis.__puprs_util__) {{
+                globalThis.__puprs_util__ = {INJECTED_SOURCE};
+            }}
+            const util = globalThis.__puprs_util__;
+            const predicateFn = util.createFunction(predicateStr);
+            const poller = {poller_ctor};
+            await poller.start();
+            try {{
+                return await poller.result();
+            }} finally {{
+                await poller.stop();
+            }}
+        }}"#,
+    );
+
+    let mut call_args = Vec::with_capacity(args_json.len() + 1);
+    call_args.push(
+        CallArgument::builder()
+            .value(serde_json::Value::String(predicate_body.to_string()))
+            .build(),
+    );
+    for arg in args_json {
+        call_args.push(CallArgument::builder().value(arg.clone()).build());
+    }
+
+    let mut params = CallFunctionOnParams::builder()
+        .function_declaration(js)
+        .await_promise(true)
+        .return_by_value(false);
+    for arg in call_args {
+        params = params.argument(arg);
+    }
+    let params = params.build().map_err(|e| Error::Other(e.to_string()))?;
+
+    let eval_future = page.evaluate_function(params);
+    let result = tokio::time::timeout(remaining, eval_future)
+        .await
+        .map_err(|_| Error::Timeout("wait task timed out".into()))??;
+
+    let object_id = result.inner.object_id.clone();
+    Ok((object_id, result))
 }

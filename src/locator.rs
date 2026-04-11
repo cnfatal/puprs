@@ -245,10 +245,13 @@ impl NodeLocator {
     /// Click with options (button, count, delay, offset).
     pub async fn click_with(&self, options: ClickOptions) -> Result<()> {
         let deadline = tokio::time::Instant::now() + self.options.timeout;
+        let mut attempts = 0u32;
         loop {
+            attempts += 1;
             match self.try_click_with(deadline, &options).await {
                 Ok(()) => return Ok(()),
                 Err(e) if is_retryable(&e) && tokio::time::Instant::now() < deadline => {
+                    tracing::debug!(attempt = attempts, error = %e, "locator click retrying");
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
                 Err(e) => return Err(e),
@@ -374,7 +377,9 @@ impl NodeLocator {
         options: &ClickOptions,
     ) -> Result<()> {
         let el = self.wait_and_check().await?;
+        tracing::trace!(backend_node_id = ?el.backend_node_id, "locator: element found, applying preconditions");
         apply_action_preconditions(&el, &self.options, deadline, true).await?;
+        tracing::trace!("locator: preconditions passed, clicking");
         el.click_with(options.clone()).await?;
         Ok(())
     }
@@ -904,10 +909,20 @@ async fn wait_for_enabled(element: &Element, timeout: Duration) -> Result<()> {
     }
 }
 
-/// Whether an error should trigger a retry.
+/// Whether an error should trigger a retry from the locator's outer loop.
+///
+/// We use an **exclusion list**: any error that could be transient (stale handle,
+/// element not yet visible, CDP race, etc.) is retried.  Only errors that are
+/// inherently non-recoverable skip the retry.
 fn is_retryable(err: &Error) -> bool {
-    matches!(
+    !matches!(
         err,
-        Error::ElementNotFound(_) | Error::JavaScript(_) | Error::Cdp(_)
+        Error::Timeout(_)
+            | Error::Connection(_)
+            | Error::Launch(_)
+            | Error::PageClosed(_)
+            | Error::InvalidState(_)
+            | Error::Io(_)
+            | Error::Serde(_)
     )
 }

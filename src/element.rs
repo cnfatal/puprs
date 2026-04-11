@@ -1,7 +1,6 @@
 use crate::cdp::browser_protocol::dom::{
-    BackendNodeId, DescribeNodeParams, GetBoxModelParams, GetContentQuadsParams, Node, NodeId,
-    QuerySelectorAllParams, QuerySelectorParams, ResolveNodeParams, ScrollIntoViewIfNeededParams,
-    SetFileInputFilesParams,
+    BackendNodeId, DescribeNodeParams, GetBoxModelParams, Node, NodeId, QuerySelectorAllParams,
+    QuerySelectorParams, ResolveNodeParams, ScrollIntoViewIfNeededParams, SetFileInputFilesParams,
 };
 use crate::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use crate::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams, RemoteObjectId};
@@ -477,38 +476,42 @@ impl Element {
     }
 
     /// Get the best clickable point of the element.
+    ///
+    /// Uses JS `getClientRects()` (like Puppeteer's `#clickableBox()`) instead
+    /// of CDP `DOM.getContentQuads` — more reliable when the element is stale
+    /// or detached.
     pub async fn clickable_point(&self) -> Result<Point> {
-        let resp = self
-            .page
-            .execute(
-                GetContentQuadsParams::builder()
-                    .backend_node_id(self.backend_node_id)
-                    .build(),
+        let result = self
+            .call_js_fn(
+                r#"function() {
+                    if (!(this instanceof Element)) {
+                        return null;
+                    }
+                    return [...this.getClientRects()].map(rect => ({
+                        x: rect.x, y: rect.y, width: rect.width, height: rect.height
+                    }));
+                }"#,
+                false,
             )
             .await?;
 
-        for quad in &resp.quads {
-            let values = quad.inner();
-            if values.len() != 8 {
-                continue;
-            }
-            // Compute area using shoelace formula
-            let area = 0.5
-                * ((values[0] * values[3] - values[2] * values[1])
-                    + (values[2] * values[5] - values[4] * values[3])
-                    + (values[4] * values[7] - values[6] * values[5])
-                    + (values[6] * values[1] - values[0] * values[7]))
-                    .abs();
-            if area > 1.0 {
-                let center_x = (values[0] + values[2] + values[4] + values[6]) / 4.0;
-                let center_y = (values[1] + values[3] + values[5] + values[7]) / 4.0;
-                return Ok(Point::new(center_x, center_y));
-            }
+        let boxes: Option<Vec<BoundingBox>> = result.into_value().ok();
+        let boxes = boxes.unwrap_or_default();
+        if boxes.is_empty() {
+            return Err(Error::Other(
+                "Node is either not clickable or not an Element".into(),
+            ));
         }
 
-        Err(Error::Other(
-            "Node is either not visible or not an HTMLElement".into(),
-        ))
+        // Find the first rect with a visible size (≥ 1×1 px).
+        let bx = boxes
+            .iter()
+            .find(|b| b.width >= 1.0 && b.height >= 1.0)
+            .ok_or_else(|| {
+                Error::Other("Node is either not visible or not an HTMLElement".into())
+            })?;
+
+        Ok(Point::new(bx.x + bx.width / 2.0, bx.y + bx.height / 2.0))
     }
 
     // ── JavaScript ──────────────────────────────────────────────────
