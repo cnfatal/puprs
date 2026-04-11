@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::broadcast;
 
@@ -152,28 +152,5 @@ impl NetworkManager {
             }
             _ => {}
         }
-    }
-
-    pub(crate) fn reset(&mut self) {
-        self.inflight.clear();
-        self.requests.clear();
-        self.last_activity = Instant::now();
-    }
-
-    pub(crate) fn is_idle(&self, max_inflight: usize, quiet_window: Duration) -> bool {
-        self.inflight.len() <= max_inflight && self.last_activity.elapsed() >= quiet_window
-    }
-
-    /// Returns the remaining quiet window duration before network idle,
-    /// or `None` if there are too many inflight requests.
-    pub(crate) fn quiet_window_remaining(
-        &self,
-        max_inflight: usize,
-        quiet_window: Duration,
-    ) -> Option<Duration> {
-        if self.inflight.len() > max_inflight {
-            return None;
-        }
-        Some(quiet_window.saturating_sub(self.last_activity.elapsed()))
     }
 }

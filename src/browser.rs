@@ -113,12 +113,12 @@ impl BrowserProcess {
     /// 3. If still alive after `timeout`, SIGKILL the process group.
     async fn shutdown_with_timeout(&mut self, timeout: Duration) {
         // Quick check: process may already be exiting from Browser.close.
-        match tokio::time::timeout(Duration::from_millis(500), self.child.wait()).await {
-            Ok(_) => {
-                self.cleanup().await;
-                return;
-            }
-            Err(_) => {}
+        if tokio::time::timeout(Duration::from_millis(500), self.child.wait())
+            .await
+            .is_ok()
+        {
+            self.cleanup().await;
+            return;
         }
 
         // Send SIGTERM for graceful shutdown.

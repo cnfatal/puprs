@@ -137,7 +137,7 @@ enum LocatorSource {
     /// CSS selector.
     Selector(String),
     /// A pre-existing element handle.
-    Handle(Element),
+    Handle(Box<Element>),
 }
 
 impl NodeLocator {
@@ -163,7 +163,7 @@ impl NodeLocator {
     pub fn from_handle(page: Page, element: Element) -> Self {
         Self {
             ctx: LocatorContext::Page(page),
-            source: LocatorSource::Handle(element),
+            source: LocatorSource::Handle(Box::new(element)),
             options: LocatorOptions::default(),
             filters: Vec::new(),
         }
@@ -324,7 +324,7 @@ impl NodeLocator {
                 )
                 .await?
                 .ok_or_else(|| Error::ElementNotFound(selector.clone())),
-            LocatorSource::Handle(element) => Ok(element.clone()),
+            LocatorSource::Handle(element) => Ok(element.as_ref().clone()),
         }
     }
 
