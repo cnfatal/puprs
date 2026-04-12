@@ -395,7 +395,17 @@ impl HTTPResponse {
         self.body_loaded.wait().await?;
 
         let params = GetResponseBodyParams::new(RequestId::new(self.request_id.clone()));
-        let result = target.execute(params).await?;
+        let result = match target.execute(params).await {
+            Ok(r) => r,
+            Err(Error::Cdp(msg)) if msg == "No resource with given identifier found" => {
+                return Err(Error::Cdp(
+                    "Could not load response body for this request. \
+                     This might happen if the request is a preflight request."
+                        .into(),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
         if result.base64_encoded {
             base64::engine::general_purpose::STANDARD
                 .decode(&result.body)
