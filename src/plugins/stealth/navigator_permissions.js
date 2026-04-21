@@ -2,8 +2,6 @@
 // Overrides Permissions.query() to return 'prompt' for the 'notifications'
 // permission. Headless Chrome returns 'denied' which is a detection signal.
 (function () {
-    const utils = window._pup_utils;
-    if (!utils) return;
 
     if (typeof Permissions === "undefined") return;
 

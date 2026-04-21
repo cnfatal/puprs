@@ -3,8 +3,6 @@
 // scripts running inside iframes also see consistent navigator properties.
 // In headless Chrome, srcdoc iframe contentWindow may leak different values.
 (function () {
-    const utils = window._pup_utils;
-    if (!utils) return;
 
     // Monitor iframe creation and patch their contentWindow
     try {

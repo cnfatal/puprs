@@ -1,8 +1,6 @@
 // chrome.app evasion
 // Provides a realistic window.chrome.app mock — headless Chrome may lack it.
 (function () {
-    const utils = window._pup_utils;
-    if (!utils) return;
 
     if (!window.chrome) {
         Object.defineProperty(window, "chrome", {

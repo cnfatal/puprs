@@ -98,7 +98,6 @@ impl StealthEvasion {
 #[derive(Debug, Clone)]
 pub struct StealthPlugin {
     user_agent: Option<String>,
-    add_automation_controlled_flag: bool,
     enabled_evasions: HashSet<StealthEvasion>,
 }
 
@@ -109,7 +108,6 @@ impl Default for StealthPlugin {
 
         Self {
             user_agent: None,
-            add_automation_controlled_flag: false,
             enabled_evasions,
         }
     }
@@ -122,11 +120,6 @@ impl StealthPlugin {
 
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = Some(user_agent.into());
-        self
-    }
-
-    pub fn set_automation_controlled_flag(mut self, enabled: bool) -> Self {
-        self.add_automation_controlled_flag = enabled;
         self
     }
 
@@ -148,10 +141,11 @@ impl Plugin for StealthPlugin {
     }
 
     async fn before_launch(&self, options: &mut LaunchOptions) -> Result<()> {
-        if !self.add_automation_controlled_flag {
-            return Ok(());
-        }
-
+        // Primary defense against `navigator.webdriver = true`: disable the
+        // Chromium feature that sets it. Applied unconditionally whenever the
+        // stealth plugin is present — the cost is effectively nil, and the
+        // JS-side evasion alone cannot reliably hide webdriver without leaving
+        // a detectable own-property descriptor.
         let mut found = false;
         for (k, v) in &mut options.args {
             if k == "--disable-blink-features" {
@@ -172,6 +166,16 @@ impl Plugin for StealthPlugin {
                 Some("AutomationControlled".to_string()),
             ));
         }
+
+        // Suppress the "You are using an unsupported command-line flag:
+        // --disable-blink-features=AutomationControlled" infobar. This flag
+        // is added by ChromeDriver/Selenium unconditionally; it only affects
+        // browser-process UI (infobars, default-browser prompt) and is not
+        // observable to page JS, network, or any navigator property.
+        if !options.args.iter().any(|(k, _)| k == "--test-type") {
+            options.args.push(("--test-type".to_string(), None));
+        }
+
         Ok(())
     }
 
@@ -181,19 +185,31 @@ impl Plugin for StealthPlugin {
         );
         page.set_user_agent(ua).await?;
 
-        // Inject utils first — all evasion scripts depend on it.
-        // Use isolated world so page scripts cannot detect or override them.
-        page.evaluate_on_new_document_in_world(UTILS_JS, "__puprs_utility_world__")
-            .await?;
+        // Compose a single main-world script containing:
+        //   1. utils bootstrap as a local `const` (no `window` leakage),
+        //   2. each enabled evasion body, each wrapped in a block so they
+        //      can safely reuse the same outer `utils` identifier.
+        //
+        // Every evasion is still an IIFE internally so temp bindings stay
+        // scoped; the outer IIFE keeps `utils` out of any global reach.
+        let mut script = String::with_capacity(UTILS_JS.len() + 1024);
+        script.push_str("(() => {\n");
+        script.push_str("const utils = (function () {\n");
+        script.push_str(UTILS_JS);
+        script.push_str("\n})();\n");
 
-        // Inject enabled evasion scripts in isolated world.
-        for evasion in &self.enabled_evasions {
-            page.evaluate_on_new_document_in_world(
-                evasion.init_script(),
-                "__puprs_utility_world__",
-            )
-            .await?;
+        // Iterate in a stable order so the composite script is deterministic.
+        for evasion in StealthEvasion::ALL {
+            if !self.enabled_evasions.contains(evasion) {
+                continue;
+            }
+            script.push_str("{\n");
+            script.push_str(evasion.init_script());
+            script.push_str("\n}\n");
         }
+        script.push_str("})();\n");
+
+        page.evaluate_on_new_document(script).await?;
 
         Ok(())
     }

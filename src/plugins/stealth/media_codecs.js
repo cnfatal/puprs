@@ -2,8 +2,6 @@
 // Patches canPlayType and MediaSource.isTypeSupported to report common codecs
 // as supported, even in headless environments that may lack them.
 (function () {
-    const utils = window._pup_utils;
-    if (!utils) return;
 
     // Map of codecs to fake-support. These cover common detection checks.
     const codecSupport = {

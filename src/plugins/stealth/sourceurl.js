@@ -3,8 +3,6 @@
 // sourceURL markers from Error stack traces.
 // Detection scripts check stack traces for these known markers.
 (function () {
-    const utils = window._pup_utils;
-    if (!utils) return;
     const _Error = utils.cache.Error;
 
     // Patch Error.prepareStackTrace if V8 engine

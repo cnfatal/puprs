@@ -3,8 +3,6 @@
 // This is one of the most sophisticated evasions since headless Chrome
 // has an empty plugin list.
 (function () {
-    const utils = window._pup_utils;
-    if (!utils) return;
     const { makeNativeToString, cache } = utils;
     const _Object = cache.Object;
 

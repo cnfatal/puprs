@@ -3,8 +3,6 @@
 // Headless Chrome often reports "Google Inc." / "ANGLE (...)  SwiftShader"
 // which is a known headless fingerprint.
 (function () {
-    const utils = window._pup_utils;
-    if (!utils) return;
 
     const VENDOR = "Intel Inc.";
     const RENDERER = "Intel Iris OpenGL Engine";

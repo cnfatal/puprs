@@ -2,8 +2,6 @@
 // In headless mode, window.outerWidth and outerHeight are 0.
 // This patches them to match innerWidth/innerHeight (plus typical chrome UI).
 (function () {
-    const utils = window._pup_utils;
-    if (!utils) return;
 
     // Only patch if outer dimensions are zero (headless indicator)
     if (window.outerWidth === 0 && window.outerHeight === 0) {
