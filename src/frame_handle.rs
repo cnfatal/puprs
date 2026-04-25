@@ -440,7 +440,7 @@ impl FrameHandle {
     /// Type text into an element in this frame.
     pub async fn type_text(&self, selector: &str, text: &str) -> Result<()> {
         let el = self.find_element(selector).await?;
-        el.type_str(text).await?;
+        el.type_str(text, None).await?;
         Ok(())
     }
 

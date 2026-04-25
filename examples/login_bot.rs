@@ -115,7 +115,7 @@ async fn human_mouse_move(page: &Page, from: (f64, f64), to: (f64, f64)) {
 async fn human_type(element: &Element, text: &str) {
     let mut rng = rand::rng();
     for ch in text.chars() {
-        element.type_str(&ch.to_string()).await.ok();
+        element.type_str(&ch.to_string(), None).await.ok();
         let delay = rng.random_range(50..180);
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }

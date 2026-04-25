@@ -249,9 +249,16 @@ impl Element {
     }
 
     /// Type text into the element (simulates key-by-key input).
-    pub async fn type_str(&self, input: impl AsRef<str>) -> Result<&Self> {
+    ///
+    /// `delay` paces characters when `Some` (matches Playwright's
+    /// `Locator.pressSequentially(text, { delay })`); pass `None` for no pacing.
+    pub async fn type_str(
+        &self,
+        input: impl AsRef<str>,
+        delay: Option<std::time::Duration>,
+    ) -> Result<&Self> {
         self.focus().await?;
-        self.page.type_str(input).await?;
+        self.page.type_str(input, delay).await?;
         Ok(self)
     }
 

@@ -1122,10 +1122,15 @@ impl Page {
         Ok(self)
     }
 
-    /// Type text character by character.
-    pub(crate) async fn type_str(&self, input: impl AsRef<str>) -> Result<&Self> {
+    /// Type text character by character. If `delay` is `Some`, waits that
+    /// duration between characters (matches Playwright's `pressSequentially`).
+    pub(crate) async fn type_str(
+        &self,
+        input: impl AsRef<str>,
+        delay: Option<std::time::Duration>,
+    ) -> Result<&Self> {
         let mut kb = self.keyboard.lock().await;
-        kb.type_text(input, None).await?;
+        kb.type_text(input, delay).await?;
         Ok(self)
     }
 
@@ -1133,6 +1138,17 @@ impl Page {
     pub(crate) async fn press_key(&self, key: impl AsRef<str>) -> Result<&Self> {
         let mut kb = self.keyboard.lock().await;
         kb.press(key, None).await?;
+        Ok(self)
+    }
+
+    /// Insert text into the currently focused element via CDP `Input.insertText`.
+    ///
+    /// Single trusted IPC — replaces the current text selection (if any).
+    /// Used by `Locator::fill` to deliver `isTrusted=true` input events,
+    /// matching Playwright's behavior for controlled framework inputs.
+    pub(crate) async fn insert_text(&self, text: impl AsRef<str>) -> Result<&Self> {
+        let kb = self.keyboard.lock().await;
+        kb.send_character(text).await?;
         Ok(self)
     }
 

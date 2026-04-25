@@ -279,6 +279,35 @@ impl NodeLocator {
         }
     }
 
+    /// Type text into the located element key-by-key.
+    ///
+    /// Equivalent to Playwright's `Locator.pressSequentially(text, { delay })`
+    /// when `delay` is `Some`. Unlike [`fill`](Self::fill) — which replaces
+    /// existing content via a single `Input.insertText` IPC — this method
+    /// **appends** at the current caret position and dispatches a real
+    /// `keydown`/`keypress`/`keyup` sequence per character. Use this when the
+    /// page relies on key event timing (e.g. autosuggest with a debounce on
+    /// each keystroke) or when you want simulated human typing rhythm.
+    ///
+    /// Pipeline: `_wait → [viewport, stable_bbox, enabled] → focus → type`.
+    pub async fn type_str(
+        &self,
+        text: impl Into<String>,
+        delay: Option<Duration>,
+    ) -> Result<()> {
+        let text = text.into();
+        let outer_deadline = tokio::time::Instant::now() + self.options.timeout;
+        loop {
+            match self.try_type_str(&text, delay, outer_deadline).await {
+                Ok(()) => return Ok(()),
+                Err(e) if is_retryable(&e) && tokio::time::Instant::now() < outer_deadline => {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Hover over the located element.
     pub async fn hover(&self) -> Result<()> {
         let deadline = tokio::time::Instant::now() + self.options.timeout;
@@ -393,6 +422,18 @@ impl NodeLocator {
         let el = self.wait_and_check().await?;
         apply_action_preconditions(&el, &self.options, deadline, true).await?;
         fill_element(&el, value, options).await
+    }
+
+    async fn try_type_str(
+        &self,
+        text: &str,
+        delay: Option<Duration>,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        let el = self.wait_and_check().await?;
+        apply_action_preconditions(&el, &self.options, deadline, true).await?;
+        el.type_str(text, delay).await?;
+        Ok(())
     }
 
     async fn try_hover(&self, deadline: tokio::time::Instant) -> Result<()> {
@@ -622,7 +663,21 @@ async fn apply_action_preconditions(
 
 /// Fill an element with a value, choosing the appropriate strategy based on
 /// element type (select, typeable input, contenteditable, etc.).
-async fn fill_element(element: &Element, value: &str, fill_opts: &FillOptions) -> Result<()> {
+///
+/// For text-bearing elements (typeable inputs and contenteditable) this uses
+/// the **Playwright-style trusted path**:
+///   1. `element.focus()`
+///   2. select existing content via DOM Selection API
+///   3. CDP `Input.insertText(value)` — a single IPC that **replaces** the
+///      selection. Events delivered to the page are `isTrusted=true`,
+///      indistinguishable from real keyboard input, which makes this safe
+///      against React/Vue controlled-input value interceptors and friendlier
+///      to anti-bot heuristics that rely on `event.isTrusted`.
+///
+/// For `<select>` and uneditable inputs (date/color/checkbox/...) we keep the
+/// classic synthesized `value = ...` + `dispatchEvent('input'/'change')`
+/// fallback — those element types don't support `insertText` anyway.
+async fn fill_element(element: &Element, value: &str, _fill_opts: &FillOptions) -> Result<()> {
     let input_type: String = element
         .call_js_fn_arg(
             r#"(el) => {
@@ -660,62 +715,46 @@ async fn fill_element(element: &Element, value: &str, fill_opts: &FillOptions) -
                 .await?;
         }
         "typeable-input" | "contenteditable" => {
-            if value.len() < fill_opts.typing_threshold {
-                // Short text: detect common prefix and only type the rest.
-                let text_to_type: String = element
-                    .call_js_fn_arg(
-                        &format!(
-                            r#"(el) => {{
-                                const newValue = {val_json};
-                                const currentValue = el.isContentEditable
-                                    ? el.innerText
-                                    : el.value;
-                                if (newValue.length <= currentValue.length
-                                    || !newValue.startsWith(currentValue)) {{
-                                    if (el.isContentEditable) {{ el.innerText = ''; }}
-                                    else {{ el.value = ''; }}
-                                    return newValue;
-                                }}
-                                if (el.isContentEditable) {{
-                                    el.innerText = '';
-                                    el.innerText = currentValue;
-                                }} else {{
-                                    el.value = '';
-                                    el.value = currentValue;
-                                }}
-                                return newValue.substring(currentValue.length);
-                            }}"#
-                        ),
-                        false,
-                    )
-                    .await
-                    .ok()
-                    .and_then(|r| r.into_value::<String>().ok())
-                    .unwrap_or_else(|| value.to_string());
+            // 1. Focus and select all existing content. Returns whether the
+            //    field had any content (so we know if a Delete is needed when
+            //    the new value is empty).
+            element.focus().await?;
+            let had_content: bool = element
+                .call_js_fn_arg(
+                    r#"(el) => {
+                        if (el.isContentEditable) {
+                            const sel = el.ownerDocument.getSelection();
+                            sel.removeAllRanges();
+                            const range = el.ownerDocument.createRange();
+                            range.selectNodeContents(el);
+                            sel.addRange(range);
+                            return (el.innerText || '').length > 0;
+                        }
+                        const len = (el.value ?? '').length;
+                        if (typeof el.select === 'function') {
+                            el.select();
+                        } else if (typeof el.setSelectionRange === 'function') {
+                            el.setSelectionRange(0, len);
+                        }
+                        return len > 0;
+                    }"#,
+                    false,
+                )
+                .await
+                .ok()
+                .and_then(|r| r.into_value::<bool>().ok())
+                .unwrap_or(false);
 
-                if !text_to_type.is_empty() {
-                    element.type_str(&text_to_type).await?;
+            // 2. Replace selection via trusted input.
+            if value.is_empty() {
+                if had_content {
+                    // Trusted Delete keystroke clears the selected range.
+                    element.page.press_key("Delete").await?;
                 }
             } else {
-                // Long text: direct assignment (fast path).
-                element
-                    .call_js_fn_arg(
-                        &format!(
-                            r#"(el) => {{
-                                const newValue = {val_json};
-                                el.focus();
-                                const currentValue = el.isContentEditable
-                                    ? el.innerText : el.value;
-                                if (currentValue === newValue) return;
-                                if (el.isContentEditable) {{ el.innerText = newValue; }}
-                                else {{ el.value = newValue; }}
-                                el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                                el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                            }}"#
-                        ),
-                        true,
-                    )
-                    .await?;
+                // Single CDP `Input.insertText` — replaces selection,
+                // delivers a trusted input event.
+                element.page.insert_text(value).await?;
             }
         }
         "other-input" => {
